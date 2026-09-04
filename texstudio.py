@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""
+texstudio.py - a small local web app for wiring up OBJ/MTL texture paths.
+
+    python3 texstudio.py                 # uses ./texstudio_workspace
+    python3 texstudio.py /path/to/model  # uses that folder
+
+Then open http://127.0.0.1:8765 . Drag your .obj, .mtl and texture files onto the page
+(or just put them in the folder), review what's broken, repoint anything by dropdown,
+and save. Originals are kept as .bak. Download a tidy zip when you're done.
+
+Pure standard library. No pip install. Binds to localhost only.
+"""
+import os, re, io, sys, json, shutil, zipfile, mimetypes, webbrowser, argparse
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, unquote
+
+IMG_EXT = ('.png','.jpg','.jpeg','.tga','.tif','.tiff','.bmp','.exr','.psd','.dds','.webp')
+VIEWABLE = ('.png','.jpg','.jpeg','.gif','.webp','.bmp')
+MAP_KEYS = ('map_kd','map_ka','map_ks','map_ke','map_ns','map_d','map_bump','bump','disp',
+            'decal','refl','map_pr','map_pm','map_ao','norm','map_refl')
+OPTS_N = {'-bm':1,'-s':3,'-o':3,'-t':3,'-mm':2,'-texres':1,'-clamp':1,'-blendu':1,
+          '-blendv':1,'-boost':1,'-imfchan':1,'-type':1,'-cc':1}
+# slots people commonly mis-wire, and where the value actually belongs
+SLOT_FIX = {'map_ks':('map_Pr','holds a roughness map; map_Ks is specular colour'),
+            'map_refl':('map_Pm','holds a metalness map; map_refl is an environment map'),
+            'map_ns':('map_Pr','holds a roughness map; map_Ns is specular exponent')}
+ROOT = None
+
+def split_map_line(rest):
+    toks = rest.split(); i = 0; opts = []
+    while i < len(toks) and toks[i].startswith('-'):
+        n = OPTS_N.get(toks[i], 1); opts += toks[i:i+1+n]; i += 1+n
+    return ' '.join(opts), ' '.join(toks[i:]).strip().strip('"')
+
+def base_any(p):
+    return re.split(r'[\\/]', p.strip().strip('"'))[-1]
+
+def images():
+    out = []
+    for r, _, fs in os.walk(ROOT):
+        if '__MACOSX' in r: continue
+        for f in fs:
+            if f.lower().endswith(IMG_EXT):
+                out.append(os.path.relpath(os.path.join(r, f), ROOT).replace(os.sep,'/'))
+    return sorted(out)
+
+def find_files(ext):
+    out = []
+    for r, _, fs in os.walk(ROOT):
+        if '__MACOSX' in r: continue
+        for f in fs:
+            if f.lower().endswith(ext):
+                out.append(os.path.relpath(os.path.join(r, f), ROOT).replace(os.sep,'/'))
+    return sorted(out)
+
+def guess(raw, mtl_rel, imgs):
+    """Resolve a map path: as written, then by basename, then by stem."""
+    d = os.path.dirname(mtl_rel)
+    cand = os.path.normpath(os.path.join(d, raw.replace('\\','/'))).replace(os.sep,'/')
+    if cand in imgs: return cand, 'ok'
+    b = base_any(raw).lower()
+    for i in imgs:
+        if os.path.basename(i).lower() == b: return i, 'relinked by name'
+    stem = os.path.splitext(b)[0]
+    for i in imgs:
+        if os.path.splitext(os.path.basename(i))[0].lower() == stem:
+            return i, 'relinked (different extension)'
+    return None, 'missing'
+
+def audit():
+    imgs = images()
+    objs = []
+    for o in find_files('.obj'):
+        named = []
+        try:
+            for line in open(os.path.join(ROOT,o), errors='replace'):
+                if line.lower().startswith('mtllib'):
+                    rest = line.split(None,1)[1].strip()
+                    d = os.path.dirname(os.path.join(ROOT,o))
+                    named += [rest] if os.path.isfile(os.path.join(d,rest)) else rest.split()
+        except Exception: pass
+        notes = []
+        for n in named:
+            p = os.path.normpath(os.path.join(os.path.dirname(o), n)).replace(os.sep,'/')
+            if not os.path.isfile(os.path.join(ROOT,p)):
+                notes.append({'lvl':'bad','msg':f"mtllib '{n}' does not exist"})
+            elif ' ' in n:
+                notes.append({'lvl':'warn','msg':f"mtllib '{n}' contains spaces (breaks many parsers)"})
+        if not named: notes.append({'lvl':'bad','msg':'no mtllib line at all'})
+        objs.append({'file':o,'notes':notes})
+
+    mtls = []
+    for m in find_files('.mtl'):
+        rows, cur, matmaps = [], None, {}
+        for ln, line in enumerate(open(os.path.join(ROOT,m), errors='replace').read().splitlines()):
+            s = line.strip()
+            if not s or s.startswith('#'): continue
+            key = s.split()[0].lower()
+            if key == 'newmtl':
+                cur = s.split(None,1)[1] if len(s.split())>1 else '?'
+                matmaps[cur] = []
+            elif key in MAP_KEYS and len(s.split())>1:
+                opts, raw = split_map_line(s.split(None,1)[1])
+                new, status = guess(raw, m, imgs)
+                slot = SLOT_FIX.get(key)
+                rows.append({'line':ln,'mat':cur,'key':s.split()[0],'raw':raw,'opts':opts,
+                             'resolved':new,'status':status,
+                             'slot_hint':(slot[0], slot[1]) if slot else None})
+                matmaps.setdefault(cur,[]).append(key)
+            elif key == 'kd' and len(s.split())==4:
+                try:
+                    v = [float(x) for x in s.split()[1:]]
+                    if max(v) < 0.99:
+                        rows.append({'line':ln,'mat':cur,'key':'Kd','raw':' '.join(f'{x:g}' for x in v),
+                                     'opts':'','resolved':None,
+                                     'status':f'darkens any texture by {100*(1-max(v)):.0f}%',
+                                     'slot_hint':None,'is_kd':True})
+                except ValueError: pass
+        mtls.append({'file':m,'rows':rows})
+    unused = [i for i in imgs if not any(r.get('resolved')==i for mm in mtls for r in mm['rows'])]
+    return {'root':ROOT,'images':imgs,'objs':objs,'mtls':mtls,'unused':unused}
+
+def apply_edits(payload):
+    """edits: [{file, line, key, path}]  kd: [{file, line, value}]"""
+    byfile = {}
+    for e in payload.get('edits',[]) + payload.get('kd',[]):
+        byfile.setdefault(e['file'], []).append(e)
+    changed = []
+    for f, es in byfile.items():
+        p = os.path.join(ROOT, f)
+        lines = open(p, errors='replace').read().splitlines()
+        for e in es:
+            i = int(e['line'])
+            if i >= len(lines): continue
+            if 'value' in e:
+                lines[i] = f"\tKd {e['value']}"
+            else:
+                cur = lines[i]
+                indent = cur[:len(cur)-len(cur.lstrip())]
+                opts = e.get('opts','')
+                rel = os.path.relpath(os.path.join(ROOT, e['path']), os.path.dirname(p)).replace(os.sep,'/')
+                lines[i] = f"{indent}{e['key']}{(' '+opts) if opts else ''} {rel}"
+        if not os.path.exists(p + '.bak'): shutil.copy2(p, p + '.bak')
+        open(p,'w').write('\n'.join(lines) + '\n')
+        changed.append(f)
+    return changed
+
+def collect_maps():
+    """Copy every referenced texture into maps/ and repoint the MTLs there."""
+    a = audit(); moved = 0
+    os.makedirs(os.path.join(ROOT,'maps'), exist_ok=True)
+    for mm in a['mtls']:
+        edits = []
+        for r in mm['rows']:
+            if r.get('resolved'):
+                src = os.path.join(ROOT, r['resolved'])
+                dst = os.path.join(ROOT,'maps', os.path.basename(r['resolved']))
+                if os.path.abspath(src) != os.path.abspath(dst):
+                    shutil.copy2(src, dst); moved += 1
+                edits.append({'file':mm['file'],'line':r['line'],'key':r['key'],
+                              'opts':r['opts'],'path':'maps/'+os.path.basename(r['resolved'])})
+        if edits: apply_edits({'edits':edits})
+    return moved
+
+def make_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
+        for r,_,fs in os.walk(ROOT):
+            if '__MACOSX' in r: continue
+            for f in fs:
+                if f.endswith('.bak'): continue
+                full = os.path.join(r,f)
+                z.write(full, os.path.relpath(full, ROOT))
+    return buf.getvalue()
+
+def safe(rel):
+    p = os.path.abspath(os.path.join(ROOT, rel))
+    if not p.startswith(os.path.abspath(ROOT)): raise ValueError('path escape')
+    return p
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _send(self, code, body, ctype='application/json'):
+        if isinstance(body,str): body = body.encode()
+        self.send_response(code); self.send_header('Content-Type',ctype)
+        self.send_header('Content-Length',str(len(body))); self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        u = urlparse(self.path); q = parse_qs(u.query)
+        if u.path == '/': return self._send(200, PAGE, 'text/html; charset=utf-8')
+        if u.path == '/api/audit': return self._send(200, json.dumps(audit()))
+        if u.path == '/api/file':
+            try: p = safe(unquote(q.get('p',[''])[0]))
+            except ValueError: return self._send(400,'{}')
+            if not os.path.isfile(p): return self._send(404,'{}')
+            ctype = mimetypes.guess_type(p)[0] or 'application/octet-stream'
+            return self._send(200, open(p,'rb').read(), ctype)
+        if u.path == '/api/zip':
+            return self._send(200, make_zip(), 'application/zip')
+        return self._send(404,'{}')
+    def do_POST(self):
+        u = urlparse(self.path)
+        n = int(self.headers.get('Content-Length',0)); raw = self.rfile.read(n)
+        if u.path == '/api/save':
+            return self._send(200, json.dumps({'changed':apply_edits(json.loads(raw))}))
+        if u.path == '/api/collect':
+            return self._send(200, json.dumps({'moved':collect_maps()}))
+        if u.path == '/api/upload':
+            d = json.loads(raw)
+            import base64
+            for f in d['files']:
+                rel = f['name'].replace('\\','/').lstrip('/')
+                dest = safe(rel); os.makedirs(os.path.dirname(dest), exist_ok=True)
+                open(dest,'wb').write(base64.b64decode(f['data']))
+            return self._send(200, json.dumps({'saved':len(d['files'])}))
+        return self._send(404,'{}')
+
+PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>Texture Studio</title>
+<style>
+*{box-sizing:border-box} body{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;
+margin:0;background:#14161a;color:#e6e8ec}
+header{padding:14px 20px;background:#1b1e24;border-bottom:1px solid #2a2f38;
+display:flex;gap:12px;align-items:center;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+h1{font-size:16px;margin:0;font-weight:600}
+.path{color:#8b93a3;font-size:12px;font-family:ui-monospace,monospace}
+button{background:#2d6cdf;color:#fff;border:0;padding:8px 14px;border-radius:6px;
+cursor:pointer;font-size:13px} button:hover{background:#3b7bee}
+button.ghost{background:#262b34} button.ghost:hover{background:#313846}
+main{padding:20px;max-width:1200px;margin:0 auto}
+#drop{border:2px dashed #39404d;border-radius:10px;padding:26px;text-align:center;
+color:#8b93a3;margin-bottom:20px;transition:.15s}
+#drop.hot{border-color:#2d6cdf;background:#1a2231;color:#cfe0ff}
+.card{background:#1b1e24;border:1px solid #2a2f38;border-radius:10px;margin-bottom:16px;overflow:hidden}
+.card h2{font-size:13px;margin:0;padding:11px 14px;background:#20242c;
+border-bottom:1px solid #2a2f38;font-family:ui-monospace,monospace;font-weight:600}
+table{width:100%;border-collapse:collapse} td,th{padding:9px 12px;text-align:left;
+border-bottom:1px solid #23272f;vertical-align:middle;font-size:13px}
+th{color:#8b93a3;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+tr:last-child td{border-bottom:0}
+.tag{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600}
+.ok{background:#12351f;color:#5fd48a} .fix{background:#3a2f10;color:#f0c057}
+.bad{background:#3d1a1c;color:#ff8b8b} .warn{background:#33241a;color:#ffab6b}
+select{background:#12151a;color:#e6e8ec;border:1px solid #333a45;border-radius:5px;
+padding:5px 7px;max-width:340px;font-size:12px}
+.raw{font-family:ui-monospace,monospace;font-size:11px;color:#8b93a3;
+max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+img.th{width:38px;height:38px;object-fit:cover;border-radius:4px;background:#000;display:block}
+.hint{color:#f0c057;font-size:11px;margin-top:3px}
+.mat{color:#9ecbff;font-family:ui-monospace,monospace;font-size:12px}
+.empty{padding:16px;color:#8b93a3} .chips{display:flex;gap:6px;flex-wrap:wrap;padding:12px 14px}
+.chip{background:#262b34;padding:4px 9px;border-radius:12px;font-size:11px;color:#a9b2c1;
+font-family:ui-monospace,monospace}
+#msg{margin-left:auto;color:#5fd48a;font-size:12px}
+input.kd{background:#12151a;color:#e6e8ec;border:1px solid #333a45;border-radius:5px;
+padding:5px 7px;width:150px;font-family:ui-monospace,monospace;font-size:12px}
+</style></head><body>
+<header><h1>Texture Studio</h1><span class="path" id="root"></span>
+<button onclick="save()">Save changes</button>
+<button class="ghost" onclick="collect()">Collect into maps/</button>
+<button class="ghost" onclick="location.href='/api/zip'">Download zip</button>
+<button class="ghost" onclick="load()">Refresh</button><span id="msg"></span></header>
+<main>
+<div id="drop">Drop .obj, .mtl and texture files here (folders work too)</div>
+<div id="out"></div></main>
+<script>
+let D=null;
+const q=s=>document.createElement(s);
+function tag(t,c){const s=q('span');s.className='tag '+c;s.textContent=t;return s}
+async function load(){
+  D=await (await fetch('/api/audit')).json();
+  document.getElementById('root').textContent=D.root;
+  const out=document.getElementById('out'); out.innerHTML='';
+  for(const o of D.objs){
+    const c=q('div');c.className='card';
+    c.innerHTML='<h2>'+o.file+'</h2>';
+    if(!o.notes.length){const d=q('div');d.className='empty';d.textContent='mtllib fine.';c.appendChild(d)}
+    for(const n of o.notes){const d=q('div');d.className='empty';
+      d.appendChild(tag(n.lvl==='bad'?'PROBLEM':'WARNING',n.lvl==='bad'?'bad':'warn'));
+      d.append(' '+n.msg);c.appendChild(d)}
+    out.appendChild(c);
+  }
+  for(const m of D.mtls){
+    const c=q('div');c.className='card';c.innerHTML='<h2>'+m.file+'</h2>';
+    if(!m.rows.length){const d=q('div');d.className='empty';d.textContent='no texture references.';c.appendChild(d);out.appendChild(c);continue}
+    const t=q('table');
+    t.innerHTML='<tr><th></th><th>Material</th><th>Slot</th><th>In the file</th><th>Points to</th><th>Status</th></tr>';
+    for(const r of m.rows){
+      const tr=q('tr');
+      const td=()=>{const x=q('td');tr.appendChild(x);return x};
+      const thumb=td();
+      if(r.resolved&&/\.(png|jpe?g|gif|webp|bmp)$/i.test(r.resolved)){
+        const im=q('img');im.className='th';im.src='/api/file?p='+encodeURIComponent(r.resolved);thumb.appendChild(im)}
+      const mt=td();mt.innerHTML='<span class="mat">'+(r.mat||'?')+'</span>';
+      td().textContent=r.key;
+      const rw=td();rw.className='raw';rw.textContent=r.raw;rw.title=r.raw;
+      const pick=td();
+      if(r.is_kd){
+        const i=q('input');i.className='kd';i.value=r.raw;i.dataset.file=m.file;i.dataset.line=r.line;i.dataset.kd='1';
+        pick.appendChild(i);
+        const b=q('button');b.className='ghost';b.style.marginLeft='6px';b.textContent='set 1 1 1';
+        b.onclick=()=>{i.value='1.000000 1.000000 1.000000'};pick.appendChild(b);
+      } else {
+        const s=q('select');s.dataset.file=m.file;s.dataset.line=r.line;
+        s.dataset.key=r.key;s.dataset.opts=r.opts||'';
+        const none=q('option');none.value='';none.textContent='— not found —';s.appendChild(none);
+        for(const img of D.images){const o=q('option');o.value=img;o.textContent=img;
+          if(img===r.resolved)o.selected=true;s.appendChild(o)}
+        s.onchange=()=>{const im=thumb.querySelector('img');
+          if(s.value&&/\.(png|jpe?g|gif|webp|bmp)$/i.test(s.value)){
+            if(im)im.src='/api/file?p='+encodeURIComponent(s.value);
+            else{const n=q('img');n.className='th';n.src='/api/file?p='+encodeURIComponent(s.value);thumb.appendChild(n)}}};
+        pick.appendChild(s);
+      }
+      const st=td();
+      if(r.is_kd) st.appendChild(tag('CHECK','warn'));
+      else if(r.status==='ok') st.appendChild(tag('OK','ok'));
+      else if(r.status==='missing') st.appendChild(tag('MISSING','bad'));
+      else st.appendChild(tag('RELINKED','fix'));
+      if(r.is_kd){const h=q('div');h.className='hint';h.textContent=r.status;st.appendChild(h)}
+      if(r.slot_hint){const h=q('div');h.className='hint';
+        h.textContent='wrong slot: '+r.slot_hint[1]+' — should be '+r.slot_hint[0];st.appendChild(h)}
+      t.appendChild(tr);
+    }
+    c.appendChild(t);out.appendChild(c);
+  }
+  if(D.unused.length){
+    const c=q('div');c.className='card';c.innerHTML='<h2>images in the folder that nothing references</h2>';
+    const d=q('div');d.className='chips';
+    for(const u of D.unused){const s=q('span');s.className='chip';s.textContent=u;d.appendChild(s)}
+    c.appendChild(d);out.appendChild(c);
+  }
+}
+async function save(){
+  const edits=[],kd=[];
+  document.querySelectorAll('select[data-file]').forEach(s=>{
+    if(s.value)edits.push({file:s.dataset.file,line:+s.dataset.line,key:s.dataset.key,
+                           opts:s.dataset.opts,path:s.value})});
+  document.querySelectorAll('input[data-kd]').forEach(i=>{
+    kd.push({file:i.dataset.file,line:+i.dataset.line,value:i.value})});
+  const r=await (await fetch('/api/save',{method:'POST',body:JSON.stringify({edits,kd})})).json();
+  msg('saved — originals kept as .bak');load();
+}
+async function collect(){
+  const r=await (await fetch('/api/collect',{method:'POST',body:'{}'})).json();
+  msg('copied '+r.moved+' texture(s) into maps/');load();
+}
+function msg(t){const m=document.getElementById('msg');m.textContent=t;setTimeout(()=>m.textContent='',4000)}
+const dz=document.getElementById('drop');
+['dragenter','dragover'].forEach(e=>dz.addEventListener(e,ev=>{ev.preventDefault();dz.classList.add('hot')}));
+['dragleave','drop'].forEach(e=>dz.addEventListener(e,ev=>{ev.preventDefault();dz.classList.remove('hot')}));
+async function walk(entry,path,out){
+  if(entry.isFile){await new Promise(r=>entry.file(f=>{out.push([path+f.name,f]);r()}))}
+  else if(entry.isDirectory){
+    const rd=entry.createReader();
+    const ents=await new Promise(r=>rd.readEntries(r));
+    for(const e of ents) await walk(e,path+entry.name+'/',out)}
+}
+dz.addEventListener('drop',async ev=>{
+  const items=[...ev.dataTransfer.items].map(i=>i.webkitGetAsEntry&&i.webkitGetAsEntry()).filter(Boolean);
+  const files=[];
+  if(items.length){for(const it of items) await walk(it,'',files)}
+  else{for(const f of ev.dataTransfer.files) files.push([f.name,f])}
+  if(!files.length)return;
+  msg('uploading '+files.length+' file(s)…');
+  const payload=[];
+  for(const [name,f] of files){
+    const b=await f.arrayBuffer();
+    let s='';const u=new Uint8Array(b);
+    for(let i=0;i<u.length;i+=8192) s+=String.fromCharCode.apply(null,u.subarray(i,i+8192));
+    payload.push({name,data:btoa(s)});
+  }
+  await fetch('/api/upload',{method:'POST',body:JSON.stringify({files:payload})});
+  msg('added '+payload.length+' file(s)');load();
+});
+load();
+</script></body></html>"""
+
+def main():
+    global ROOT
+    ap = argparse.ArgumentParser()
+    ap.add_argument('folder', nargs='?', default='texstudio_workspace')
+    ap.add_argument('--port', type=int, default=8765)
+    ap.add_argument('--no-browser', action='store_true')
+    a = ap.parse_args()
+    ROOT = os.path.abspath(a.folder)
+    os.makedirs(ROOT, exist_ok=True)
+    url = f'http://127.0.0.1:{a.port}'
+    print(f"Texture Studio\n  workspace: {ROOT}\n  open:      {url}\n  (ctrl-c to stop)")
+    if not a.no_browser:
+        try: webbrowser.open(url)
+        except Exception: pass
+    ThreadingHTTPServer(('127.0.0.1', a.port), H).serve_forever()
+
+if __name__ == '__main__':
+    main()
