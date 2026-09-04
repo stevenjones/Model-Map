@@ -17,7 +17,7 @@ just that the paths look right.
 import gc, io, os, gzip, json, shutil, struct, sys, tempfile, unittest, warnings, zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import texcheck, fbxread, blendread
+import texcheck, fbxread, blendread, gltfread
 
 
 def _read(path, mode='r'):
@@ -428,6 +428,28 @@ Texture: 1234, "Texture::Map1", "" {
         self.assertEqual(len(info['textures']), 1)
         self.assertEqual(info['textures'][0]['file'], 'textures/albedo.png')
 
+    def test_relative_subfolder_path_is_not_a_false_positive(self):
+        """An FBX storing textures\\foo.png with the file really there is CORRECT.
+        It must report OK, not FIX - the earlier version only looked beside the
+        FBX and flagged working paths as broken."""
+        os.makedirs(os.path.join(self.d, 'textures'), exist_ok=True)
+        tiny_png(os.path.join(self.d, 'textures', 'foo.png'))
+        p = make_fbx(os.path.join(self.d, 'r.fbx'), 7400,
+                     [('M1', 'textures\\foo.png', 'DiffuseColor', 'Mat')])
+        idx = texcheck.build_index([self.d])
+        import io as _io, contextlib
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            missing = texcheck.audit_fbx(p, idx, fix=False)
+        out = buf.getvalue()
+        self.assertEqual(missing, 0)
+        self.assertIn('[OK  ]', out)
+        self.assertNotIn('[FIX ]', out)
+
+    def test_reflectionfactor_flagged_as_wrong_slot(self):
+        self.assertEqual(texcheck.FBX_SLOT_FIX.get('reflectionfactor'), 'metalness')
+        self.assertEqual(texcheck.FBX_SLOT_FIX.get('shininessexponent'), 'roughness')
+
     def test_corrupt_file_returns_error_not_exception(self):
         p = os.path.join(self.d, 'bad.fbx')
         with open(p, 'wb') as f:
@@ -437,11 +459,99 @@ Texture: 1234, "Texture::Map1", "" {
 
 
 # --------------------------------------------------------------- wiring
+class TestGltf(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.d, 'textures'))
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def write(self, images, buffers=None):
+        doc = {'asset': {'version': '2.0', 'generator': 'test'},
+               'meshes': [{}], 'materials': [{}, {}],
+               'buffers': buffers if buffers is not None else [{'uri': 'm.bin'}],
+               'images': images}
+        p = os.path.join(self.d, 'm.gltf')
+        with open(p, 'w') as f: json.dump(doc, f)
+        return p
+
+    def test_reads_uris_and_counts(self):
+        p = self.write([{'uri': 'textures/a.jpg', 'mimeType': 'image/jpeg'}])
+        i = gltfread.read_gltf(p)
+        self.assertTrue(i['ok'])
+        self.assertEqual(i['version'], '2.0')
+        self.assertEqual(i['images'][0]['uri'], 'textures/a.jpg')
+        self.assertEqual(i['counts']['materials'], 2)
+
+    def test_exr_flagged_as_invalid_for_gltf(self):
+        """glTF permits PNG and JPEG only - an .exr parses but no viewer will load it."""
+        p = self.write([{'uri': 'textures/n.exr'}, {'uri': 'textures/ok.png'}])
+        i = gltfread.read_gltf(p)
+        self.assertFalse(i['images'][0]['spec_ok'])
+        self.assertTrue(i['images'][1]['spec_ok'])
+
+    def test_mimetype_mismatch_detected(self):
+        p = self.write([{'uri': 'textures/a.png', 'mimeType': 'image/jpeg'}])
+        i = gltfread.read_gltf(p)
+        self.assertFalse(i['images'][0]['mime_matches'])
+
+    def test_embedded_data_uri_not_treated_as_a_file(self):
+        p = self.write([{'uri': 'data:image/png;base64,iVBORw0KGgo=', 'mimeType': 'image/png'}])
+        i = gltfread.read_gltf(p)
+        self.assertTrue(i['images'][0]['embedded'])
+        self.assertTrue(i['images'][0]['spec_ok'])
+
+    def test_glb_style_bufferview_image_is_embedded(self):
+        p = self.write([{'bufferView': 0, 'mimeType': 'image/png'}])
+        i = gltfread.read_gltf(p)
+        self.assertTrue(i['images'][0]['embedded'])
+
+    def test_repoint_rewrites_uri_and_fixes_mimetype(self):
+        p = self.write([{'uri': 'textures/a.png', 'mimeType': 'image/png'}])
+        ch, notes = gltfread.repoint_gltf(p, {'textures/a.png': 'textures/a.jpg'})
+        self.assertEqual(ch, 1)
+        i = gltfread.read_gltf(p)
+        self.assertEqual(i['images'][0]['uri'], 'textures/a.jpg')
+        self.assertEqual(i['images'][0]['mimeType'], 'image/jpeg',
+                         'mimeType must follow the new extension')
+        self.assertTrue(i['images'][0]['mime_matches'])
+
+    def test_repoint_keeps_backup_and_valid_json(self):
+        p = self.write([{'uri': 'a.png'}])
+        gltfread.repoint_gltf(p, {'a.png': 'b.png'})
+        self.assertTrue(os.path.exists(p + '.bak'))
+        with open(p) as f: json.load(f)          # must still parse
+
+    def test_repoint_preserves_everything_else(self):
+        """Only image uris may change - meshes, buffers and materials stay put."""
+        p = self.write([{'uri': 'a.png'}])
+        with open(p) as f: before = json.load(f)
+        gltfread.repoint_gltf(p, {'a.png': 'b.png'})
+        with open(p) as f: after = json.load(f)
+        self.assertEqual(before['meshes'], after['meshes'])
+        self.assertEqual(before['buffers'], after['buffers'])
+        self.assertEqual(before['materials'], after['materials'])
+        self.assertEqual(before['asset'], after['asset'])
+
+    def test_repoint_to_non_spec_format_warns(self):
+        p = self.write([{'uri': 'a.png'}])
+        ch, notes = gltfread.repoint_gltf(p, {'a.png': 'a.exr'})
+        self.assertEqual(ch, 1)
+        self.assertTrue(any('does not allow' in n for n in notes))
+
+    def test_malformed_json_returns_error_not_exception(self):
+        p = os.path.join(self.d, 'bad.gltf')
+        with open(p, 'w') as f: f.write('{ not json')
+        i = gltfread.read_gltf(p)
+        self.assertFalse(i['ok'])
+        self.assertIsNotNone(i['error'])
+
+
 class TestModuleWiring(unittest.TestCase):
     def test_all_four_modules_import(self):
         """The check that would have caught fbxread/blendread missing from the repo."""
         import importlib
-        for m in ('texcheck', 'texstudio', 'fbxread', 'blendread'):
+        for m in ('texcheck', 'texstudio', 'fbxread', 'blendread', 'gltfread'):
             self.assertTrue(importlib.import_module(m))
 
     def test_texstudio_has_no_third_party_imports(self):
@@ -510,6 +620,13 @@ class TestNoFileHandleLeaks(unittest.TestCase):
         p = make_fbx(os.path.join(self.d, 'a.fbx'), 7400,
                      [('M1', 'tex/a.png', 'DiffuseColor', 'Mat')])
         self.assertNoLeak(lambda: fbxread.read_fbx(p), 'read_fbx')
+
+    def test_gltfread_closes_handles(self):
+        p = os.path.join(self.d, 'm.gltf')
+        with open(p, 'w') as f:
+            json.dump({'asset': {'version': '2.0'}, 'images': [{'uri': 'a.png'}]}, f)
+        self.assertNoLeak(lambda: gltfread.read_gltf(p), 'read_gltf')
+        self.assertNoLeak(lambda: gltfread.repoint_gltf(p, {'a.png': 'b.png'}), 'repoint_gltf')
 
     def test_texcheck_closes_handles(self):
         tiny_png(os.path.join(self.d, 'textures', 'w.png'))

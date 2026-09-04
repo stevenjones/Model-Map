@@ -36,6 +36,7 @@ SLOT_FIX = {'map_ks':('map_Pr','holds a roughness map; map_Ks is specular colour
 # FBX slots that commonly hold the wrong kind of map
 FBX_SLOT_FIX = {'specularcolor':('roughness','SpecularColor is a specular COLOUR slot'),
                 'reflectioncolor':('metalness','ReflectionColor is an environment slot'),
+                'reflectionfactor':('metalness','ReflectionFactor is a scalar reflectivity slot'),
                 'shininessexponent':('roughness','ShininessExponent is not roughness')}
 ROOT = None
 

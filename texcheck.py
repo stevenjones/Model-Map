@@ -18,6 +18,10 @@ try:
     from blendread import read_blend, repoint_blend
 except Exception:
     read_blend = repoint_blend = None
+try:
+    from gltfread import read_gltf, repoint_gltf
+except Exception:
+    read_gltf = repoint_gltf = None
 
 MAP_KEYS = ('map_kd','map_ka','map_ks','map_ke','map_ns','map_d','map_bump','bump',
             'disp','decal','refl','map_pr','map_pm','map_ao','norm','map_refl')
@@ -132,7 +136,7 @@ def audit_mtl(mtl_path, idx, fix=False, collect=False):
     return issues, changed
 
 FBX_SLOT_FIX = {'specularcolor':'roughness','reflectioncolor':'metalness',
-                'shininessexponent':'roughness'}
+                'reflectionfactor':'metalness','shininessexponent':'roughness'}
 
 def audit_fbx(path, idx, fix=False):
     if read_fbx is None:
@@ -145,20 +149,24 @@ def audit_fbx(path, idx, fix=False):
     dest_dir, placed, missing = os.path.dirname(os.path.abspath(path)), [], []
     for t in info['textures']:
         want = basename_any(t["file"])
-        hit = idx.get(want.lower())
+        # FIRST try the stored path as written, relative to the FBX. A path like
+        # textures\\foo.jpg is CORRECT and must not be reported as needing a fix.
+        as_written = os.path.normpath(os.path.join(dest_dir, t['file'].replace('\\', '/')))
+        resolves = os.path.isfile(as_written)
+        hit = as_written if resolves else idx.get(want.lower())
         if not hit:
             stem = os.path.splitext(want)[0].lower()
             for k, v in idx.items():
                 if os.path.splitext(k)[0] == stem: hit = v; break
         short = t['file'] if len(t['file']) < 52 else '...' + t['file'][-49:]
-        tag = 'OK  ' if hit and os.path.dirname(os.path.abspath(hit)) == dest_dir else ('FIX ' if hit else 'MISS')
+        tag = 'OK  ' if resolves else ('FIX ' if hit else 'MISS')
         note = ''
         slot = (t['slot'] or '').lower()
         if slot in FBX_SLOT_FIX: note = f"   << likely wrong slot: holds a {FBX_SLOT_FIX[slot]} map"
         print(f"   [{tag}] {(t['material'] or '-')[:14]:14s} {(t['slot'] or '?'):22s} {short}{note}")
         if hit:
             dst = os.path.join(dest_dir, want)
-            if fix and os.path.abspath(hit) != os.path.abspath(dst):
+            if fix and not resolves and os.path.abspath(hit) != os.path.abspath(dst):
                 shutil.copy2(hit, dst); placed.append(want)
         else:
             missing.append(want)
@@ -199,6 +207,64 @@ def audit_blend(path, idx, fix=False):
     if miss: print(f"   not found: {', '.join(sorted(set(miss))[:4])}")
     return len(miss)
 
+def audit_gltf(path, idx, fix=False):
+    if read_gltf is None:
+        print("   (gltfread.py not found beside texcheck.py - .gltf skipped)"); return 0
+    info = read_gltf(path)
+    if info['error']: print(f"   !! {info['error']}"); return 0
+    c = info['counts']
+    print(f"   glTF {info['version']}  {info['generator']}")
+    print(f"   {c.get('meshes',0)} mesh(es)  {c.get('materials',0)} material(s)  "
+          f"{c.get('images',0)} image reference(s)")
+    d = os.path.dirname(os.path.abspath(path))
+    for b in info['buffers']:
+        if b['embedded']: continue
+        ok = os.path.isfile(os.path.join(d, b['uri']))
+        print(f"   [{'OK  ' if ok else 'MISS'}] buffer   {b['uri']}"
+              + ('' if ok else '   << the geometry lives here; without it there is no model'))
+    mapping, miss = {}, []
+    seen = set()
+    for im in info['images']:
+        if im['embedded']: continue
+        uri = im['uri']
+        if uri in seen: continue
+        seen.add(uri)
+        rel = uri.replace('\\', '/')
+        exact = os.path.isfile(os.path.join(d, rel))
+        base = basename_any(rel)
+        hit = None if exact else idx.get(base.lower())
+        alt = None
+        if not exact and not hit:
+            stem = os.path.splitext(base)[0].lower()
+            for k, v in idx.items():
+                if os.path.splitext(k)[0] == stem:
+                    hit = v; alt = os.path.splitext(k)[1]; break
+        flags = []
+        if not im['spec_ok']:
+            flags.append('NOT PNG/JPEG - invalid in glTF')
+        if not im['mime_matches']:
+            flags.append(f"mimeType says {im['mimeType']}")
+        if exact: tag = 'OK  '
+        elif hit and alt and alt not in ('.png', '.jpg', '.jpeg'):
+            tag = 'FMT '
+            flags.append(f'only a {alt} exists, which glTF cannot use')
+        elif hit: tag = 'FIX '
+        else: tag = 'MISS'; miss.append(base)
+        short = uri if len(uri) < 56 else '...' + uri[-53:]
+        print(f"   [{tag}] image    {short}" + ('   << ' + '; '.join(flags) if flags else ''))
+        if hit and tag == 'FIX ':
+            mapping[uri] = os.path.relpath(hit, d).replace(os.sep, '/')
+            print(f"          -> {mapping[uri]}")
+        elif tag == 'MISS':
+            print( "          -> not found anywhere searched")
+    if fix and mapping:
+        ch, notes = repoint_gltf(path, mapping)
+        print(f"   rewrote {ch} uri(s) (original kept as .bak)")
+        for n in notes: print(f"     {n}")
+    elif mapping:
+        print(f"   {len(mapping)} uri(s) can be repointed with --fix")
+    return len(miss)
+
 def main():
     ap = argparse.ArgumentParser(description="Find and fix broken texture links in OBJ/MTL.")
     ap.add_argument('target', help='an .obj, an .mtl, or a folder')
@@ -215,19 +281,21 @@ def main():
             for f in fs:
                 if f.lower().endswith('.obj'): objs.append(os.path.join(r,f))
                 elif f.lower().endswith('.mtl'): mtls.append(os.path.join(r,f))
-    elif t.lower().endswith(('.fbx','.blend')): objs=[]
+    elif t.lower().endswith(('.fbx','.blend','.gltf')): objs=[]
     elif t.lower().endswith('.obj'): objs=[t]
     elif t.lower().endswith('.mtl'): mtls=[t]
     else: sys.exit('give me an .obj, an .mtl, or a folder')
 
-    fbxs, blends = [], []
+    fbxs, blends, gltfs = [], [], []
     if os.path.isdir(t):
         for r,_,fs in os.walk(t):
             for f in fs:
                 if f.lower().endswith('.fbx'): fbxs.append(os.path.join(r,f))
                 elif f.lower().endswith('.blend'): blends.append(os.path.join(r,f))
+                elif f.lower().endswith('.gltf'): gltfs.append(os.path.join(r,f))
     elif t.lower().endswith('.fbx'): fbxs=[t]
     elif t.lower().endswith('.blend'): blends=[t]
+    elif t.lower().endswith('.gltf'): gltfs=[t]
 
     idx = build_index([root] + a.search)
     print(f"indexed {len(idx)} image files under {root}" + (f" (+{len(a.search)} extra)" if a.search else ""))
@@ -252,6 +320,10 @@ def main():
     for bl in blends:
         print(f"\nBLEND  {os.path.relpath(bl, root)}")
         audit_blend(bl, idx, a.fix)
+
+    for g in gltfs:
+        print(f"\nGLTF  {os.path.relpath(g, root)}")
+        audit_gltf(g, idx, a.fix)
 
     total_missing = 0
     for m in sorted(set(mtls)):
