@@ -1,108 +1,114 @@
-# Texture Studio — a local drop-and-edit app
+# Model-Map
 
-A small web app that runs on your own machine. Drop files on it, see exactly what's broken,
-repoint textures from dropdowns with thumbnails, save.
+Find and fix broken texture links in 3D model files — **OBJ/MTL, FBX and .blend**.
 
-**No installs.** Python standard library only, so if you have Python 3 you can run it. It binds
-to `127.0.0.1` — nothing is exposed to your network, and nothing leaves your machine.
+Downloaded models routinely arrive with texture paths pointing at the author's hard drive
+(`N:\M n B\_MESH\...`), or at a `.png` when the archive shipped `.jpg`, or with a roughness map
+plugged into the specular slot. None of these throw an error. They render wrong, or render grey,
+and you find out later.
 
-## Run it
+This finds them, and fixes what can be fixed safely.
 
-```
+**No dependencies.** Python standard library only — nothing to `pip install`.
+
+## Requirements
+
+Python 3.7+ (uses `ThreadingHTTPServer`).
+
+## The app
+
+```bash
 python3 texstudio.py                      # uses ./texstudio_workspace
-python3 texstudio.py "C:/Models/Chair"     # or point it at an existing folder
+python3 texstudio.py "/path/to/model"     # or point it at an existing folder
 ```
 
-It opens `http://127.0.0.1:8765` in your browser. Ctrl-C in the terminal to stop.
+Opens `http://127.0.0.1:8765`. Drop `.obj`, `.mtl`, `.fbx`, `.blend` and texture files on the
+page — folders work too. You get one row per texture reference: the material, the slot, the raw
+path as written in the file, and a thumbnail of what it currently resolves to. Repoint anything
+from a dropdown of every image in the workspace; the thumbnail updates before you commit.
 
-## Use it
+Buttons: **Save changes**, **Collect into maps/** (copies every texture into one folder and
+repoints to it — this is what makes a model portable), **Place FBX textures**,
+**Repoint .blend paths**, **Download zip**.
 
-1. **Drop files on the page** — `.obj`, `.mtl`, textures, or whole folders. They're copied into
-   the workspace. (Or just put them in the folder yourself and hit Refresh.)
-2. **Read the table.** One row per texture reference, showing the material, the slot, the raw
-   path as written in the file, and a thumbnail of what it currently resolves to.
-3. **Fix anything with the dropdown.** Every image in the workspace is listed. Pick a different
-   one and the thumbnail updates immediately, so you can confirm you've grabbed the right map
-   before committing.
-4. **Save changes.** Writes the MTL with working relative paths. **The original is kept as
-   `.bak`.**
-5. **Collect into maps/** — copies every referenced texture into one `maps/` folder and
-   repoints the MTL there. This is what makes a model portable.
-6. **Download zip** — the tidied folder, ready to hand on.
+## The command line
 
-## What it flags
+```bash
+python3 texcheck.py MODEL.obj                       # report only, changes nothing
+python3 texcheck.py MODEL.obj --fix                 # rewrite paths (keeps .bak)
+python3 texcheck.py MODEL.obj --fix --collect       # also copy textures into maps/
+python3 texcheck.py FOLDER --search ~/Textures      # search elsewhere too (repeatable)
+python3 texcheck.py FOLDER --fix                    # walk a whole library
+```
 
-Everything below is a real fault from files you've sent me this session:
+## What it detects
 
-| Row status | Meaning |
+- Dead absolute paths (`N:\...`, `C:\Users\...`, `D:/`)
+- `mtllib` naming a file that doesn't exist — and it names the MTLs sitting beside it
+- **Filenames containing spaces** — valid, but breaks many parsers
+- Textures findable under a different extension (`.png` referenced, `.jpg` shipped)
+- **`Kd` values that darken a texture** — `Kd 0.084` renders soil near-black
+- **Maps in the wrong slot** — `map_Ks` holding roughness, `map_refl` holding metalness,
+  `SpecularColor` holding a roughness map in FBX
+- Images in the folder that nothing references — often an AO or normal map the exporter dropped
+
+## Per-format behaviour, and why it differs
+
+| Format | What happens |
 |---|---|
-| **OK** | resolves as written |
-| **RELINKED** | the path was dead but I found the file — by name, or by stem if the extension differs |
-| **MISSING** | genuinely not in the workspace. Drop it on the page and hit Refresh |
-| **CHECK** | a `Kd` value that will multiply a texture darker, with a one-click "set 1 1 1" |
+| **OBJ / MTL** | Paths rewritten in place. `.bak` kept. MTL options such as `-bm 0.3000` are preserved. |
+| **FBX** | **Read-only.** A binary FBX cannot be safely rewritten — its internal node offsets would all have to be rebuilt, and getting that wrong corrupts the file silently. Instead, textures are copied beside the FBX under the exact filename it asks for, which is what every importer falls back to. The FBX itself is never modified. |
+| **.blend** | Paths repointed **in place**. Blender stores each path in a fixed-size buffer, so a same-length-or-shorter replacement (e.g. `.png` → `.jpg`) changes nothing else in the file — no offsets move, DNA untouched. `.bak` kept. |
 
-It also reports, above the table:
+**.blend compression:** gzip and uncompressed are supported. Blender 3.0+ can save with zstd,
+which the standard library cannot read — the tool detects this and tells you to re-save with
+compression off, or `pip install zstandard`.
 
-- `mtllib` naming a file that doesn't exist
-- **`mtllib` names containing spaces** — valid but breaks many parsers
-- **wrong slots**: `map_Ks` holding a roughness map, `map_refl` holding metalness, `map_Ns`
-  holding roughness. These are the ones that fail *quietly* — no error, just a wrong render
-- **images in the folder that nothing references** — usually an AO or normal map the exporter
-  forgot to wire
+## Security model
 
-## Tested on your own files
+The app binds to `127.0.0.1` and is **not reachable from your network**. Be clear about what that
+does and does not mean:
 
-I ran it against two of the models from this session:
+- There is **no authentication**. Any process on the same machine can call its endpoints.
+- `/api/upload` writes files into the workspace. Path traversal is blocked, but it is a write
+  endpoint.
+- **Do not change the bind address to `0.0.0.0`.** It is not built to be exposed.
 
-```
-Chair 2.obj    [warn] mtllib 'Chair 2.mtl' contains spaces
+Nothing is sent anywhere. No telemetry, and no network access beyond serving your own browser.
 
-Chair 2.mtl
-   map_Ka    relinked by name  -> Textures/Chair2Albedo.png
-   map_Kd    relinked by name  -> Textures/Chair2Albedo.png
-   map_Ks    relinked by name  -> Textures/Chair2Rough.png   << WRONG SLOT -> map_Pr
-   map_bump  relinked by name  -> Textures/Map__7_Normal_Bump.png
-   map_refl  relinked by name  -> Textures/Chair2Metal.png   << WRONG SLOT -> map_Pm
+## Platform
 
-painting.mtl
-   Kd        darkens any texture by 100%   << Kd trap
-   Kd        darkens any texture by 20%    << Kd trap
-   map_Kd    missing
-   map_d     missing
+Developed and tested on Linux and macOS. It should work on Windows — no shell calls, no
+POSIX-only path handling — but it is **untested** there. `Start Texture Studio.command` is a
+macOS launcher; on Windows run `python3 texstudio.py` directly.
 
-images nothing references: ['Textures/Chair2AO.png', 'Textures/Chair2Normal.png']
-```
+Thumbnails render only for formats browsers can display (PNG, JPG, WebP, BMP, GIF). TGA, TIFF,
+EXR and PSD are still listed and relinked correctly, they just do not preview.
 
-Every one of those is a genuine fault I had to fix by hand earlier. It also correctly reported
-the painting's textures as *missing* rather than inventing a match, and spotted the chair's AO
-map sitting unused.
+## What it does not do
 
-After "Collect into maps/" I re-checked the result with my separate inspector: all five paths
-resolve, `-bm 0.3000` survived the rewrite, and the `.bak` was kept.
+It fixes **plumbing, not judgement**. It cannot tell you:
 
-## Two tools, different jobs
+- whether a normal map is OpenGL or DirectX (that needs measuring against a height or AO map)
+- whether a "roughness" map is really glossiness that needs inverting
+- which of two texture sets belongs to which mesh when the names do not say
+- whether a map in an odd slot was a mistake or deliberate
 
-- **`texstudio.py`** — the app. Best when you want to *see* the textures and make choices.
-- **`texcheck.py`** — the command-line version from before. Best for batch work:
-  `python3 texcheck.py C:/Models/ --fix --collect` walks an entire library in one go.
-
-They share the same logic; use whichever suits the task.
-
-## Honest limits
-
-**It fixes plumbing, not judgement.** It will not tell you whether a normal map is OpenGL or
-DirectX, whether a "roughness" map is really glossiness that needs inverting, or which of two
-texture sets belongs to which object. Those need measuring against the actual pixels, which is
-most of what I've been doing for you.
-
-It flags the `Kd` trap and the wrong-slot traps because those are unambiguous — the file is
-plainly saying something it doesn't mean.
-
-**Also worth knowing:** thumbnails only render for formats browsers can display (PNG, JPG, WebP,
-BMP, GIF). TGA, TIFF, EXR and PSD will still be listed and relinked correctly, they just won't
-preview.
+It flags the `Kd` and wrong-slot cases because those are unambiguous — the file is plainly saying
+something it does not mean. The rest needs a human looking at the image data.
 
 ## Files
 
-- `texstudio.py` — the app, 396 lines, no dependencies
-- `texcheck.py` — the CLI version, 178 lines
+| File | Purpose |
+|---|---|
+| `texstudio.py` | The drag-and-drop app |
+| `texcheck.py` | The command-line version |
+| `fbxread.py` | FBX reader — **required** for `.fbx` support |
+| `blendread.py` | `.blend` reader and repointer — **required** for `.blend` support |
+
+All four must sit in the **same folder**. `texstudio` and `texcheck` import the other two; if
+either is missing, that format is skipped with a note rather than an error.
+
+## License
+
+MIT — see `LICENSE`.
