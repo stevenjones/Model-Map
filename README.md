@@ -78,12 +78,16 @@ Nothing is sent anywhere. No telemetry, and no network access beyond serving you
 
 ## Platform
 
-Developed and tested on Linux and macOS. It should work on Windows — no shell calls, no
-POSIX-only path handling — but it is **untested** there. `Start Texture Studio.command` is a
-macOS launcher; on Windows run `python3 texstudio.py` directly.
+Tested on Linux, macOS and Windows, on Python 3.9 and 3.12, via CI on every push.
+Python 3.7 is the floor (`ThreadingHTTPServer`), though only 3.9 and above are
+exercised in CI.
 
-Thumbnails render only for formats browsers can display (PNG, JPG, WebP, BMP, GIF). TGA, TIFF,
-EXR and PSD are still listed and relinked correctly, they just do not preview.
+`Start Texture Studio.command` is a macOS launcher; on Windows run
+`python3 texstudio.py` directly.
+
+Thumbnails render only for formats browsers can display (PNG, JPG, WebP, BMP,
+GIF). TGA, TIFF, EXR and PSD are still listed and relinked correctly, they just
+do not preview.
 
 ## What it does not do
 
