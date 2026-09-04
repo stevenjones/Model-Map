@@ -18,7 +18,8 @@ def _decompress(path):
     """Return (raw_bytes, kind). kind is 'raw', 'gzip', or 'zstd' (unsupported)."""
     with open(path, 'rb') as f: head = f.read(4)
     if head[:7] == b'BLENDER'[:4] and open(path,'rb').read(7) == b'BLENDER':
-        return open(path,'rb').read(), 'raw'
+        with open(path,'rb') as fh:
+            return fh.read(), 'raw'
     if head[:2] == b'\x1f\x8b':
         with gzip.open(path,'rb') as f: return f.read(), 'gzip'
     if head == b'\x28\xb5\x2f\xfd':
@@ -28,7 +29,8 @@ def _decompress(path):
                 return zstd.ZstdDecompressor().stream_reader(f).read(), 'zstd'
         except ImportError:
             return None, 'zstd'
-    return open(path,'rb').read(), 'raw'
+    with open(path,'rb') as fh:
+        return fh.read(), 'raw'
 
 class _Blend:
     """Minimal .blend reader: block table + DNA, enough to locate Image paths."""
@@ -140,7 +142,8 @@ def repoint_blend(path, mapping, backup=True):
         if kind == 'gzip':
             with gzip.open(tmp, 'wb') as f: f.write(bytes(data))
         else:
-            open(tmp, 'wb').write(bytes(data))
+            with open(tmp, 'wb') as fh:
+                fh.write(bytes(data))
         os.replace(tmp, path)
     return changed, toolong
 

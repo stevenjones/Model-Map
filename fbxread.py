@@ -63,7 +63,8 @@ def _walk_binary(d):
     return ver, nodes
 
 def _read_binary(path):
-    d = open(path, 'rb').read()
+    with open(path, 'rb') as fh:
+        d = fh.read()
     ver, nodes = _walk_binary(d)
     objs, conns, files, cur = {}, [], {}, None
     for depth, name, vals in nodes:
@@ -84,7 +85,8 @@ def _read_binary(path):
 
 # ---------------------------------------------------------------- ascii FBX
 def _read_ascii(path):
-    txt = open(path, errors='replace').read()
+    with open(path, errors='replace') as fh:
+        txt = fh.read()
     ver = 0
     m = re.search(r'FBXVersion:\s*(\d+)', txt)
     if m: ver = int(m.group(1))
@@ -103,7 +105,8 @@ def _read_ascii(path):
 
 # ---------------------------------------------------------------- public
 def read_fbx(path):
-    head = open(path, 'rb').read(32)
+    with open(path, 'rb') as fh:
+        head = fh.read(32)
     is_bin = head.startswith(b'Kaydara FBX Binary')
     out = {'format': 'binary' if is_bin else 'ascii', 'version': 0,
            'textures': [], 'materials': [], 'error': None}

@@ -10,6 +10,14 @@ texcheck.py - find and fix broken texture links in OBJ/MTL files.
 Pure standard library. No installs. Works on Windows, macOS and Linux.
 """
 import os, re, sys, shutil, argparse
+try:
+    from fbxread import read_fbx
+except Exception:
+    read_fbx = None
+try:
+    from blendread import read_blend, repoint_blend
+except Exception:
+    read_blend = repoint_blend = None
 
 MAP_KEYS = ('map_kd','map_ka','map_ks','map_ke','map_ns','map_d','map_bump','bump',
             'disp','decal','refl','map_pr','map_pm','map_ao','norm','map_refl')
@@ -63,7 +71,9 @@ def find_mtls(obj_path):
     d = os.path.dirname(os.path.abspath(obj_path)) or '.'
     named, out = [], []
     try:
-        for line in open(obj_path, errors='replace'):
+        with open(obj_path, errors='replace') as fh:
+            _ls = fh.readlines()
+        for line in _ls:
             if line.lower().startswith('mtllib'):
                 rest = line.split(None, 1)[1].strip()
                 # the whole remainder may be ONE name containing spaces; prefer that
@@ -81,7 +91,8 @@ def find_mtls(obj_path):
 
 def audit_mtl(mtl_path, idx, fix=False, collect=False):
     d = os.path.dirname(os.path.abspath(mtl_path))
-    lines = open(mtl_path, errors='replace').read().splitlines()
+    with open(mtl_path, errors='replace') as fh:
+        lines = fh.read().splitlines()
     out, issues, changed, cur = [], [], 0, None
     for line in lines:
         s = line.strip()
@@ -116,8 +127,77 @@ def audit_mtl(mtl_path, idx, fix=False, collect=False):
         out.append(line)
     if fix and changed:
         shutil.copy2(mtl_path, mtl_path + '.bak')
-        open(mtl_path,'w').write('\n'.join(out) + '\n')
+        with open(mtl_path,'w') as fh:
+            fh.write('\n'.join(out) + '\n')
     return issues, changed
+
+FBX_SLOT_FIX = {'specularcolor':'roughness','reflectioncolor':'metalness',
+                'shininessexponent':'roughness'}
+
+def audit_fbx(path, idx, fix=False):
+    if read_fbx is None:
+        print("   (fbxread.py not found beside texcheck.py - FBX skipped)"); return 0
+    info = read_fbx(path)
+    print(f"   [{info['format']} v{info['version']}]"
+          + (f"  materials: {', '.join(info['materials'][:4])}" if info['materials'] else ''))
+    if info['error']: print(f"   !! {info['error']}"); return 0
+    if not info['textures']: print("   no texture references"); return 0
+    dest_dir, placed, missing = os.path.dirname(os.path.abspath(path)), [], []
+    for t in info['textures']:
+        want = basename_any(t["file"])
+        hit = idx.get(want.lower())
+        if not hit:
+            stem = os.path.splitext(want)[0].lower()
+            for k, v in idx.items():
+                if os.path.splitext(k)[0] == stem: hit = v; break
+        short = t['file'] if len(t['file']) < 52 else '...' + t['file'][-49:]
+        tag = 'OK  ' if hit and os.path.dirname(os.path.abspath(hit)) == dest_dir else ('FIX ' if hit else 'MISS')
+        note = ''
+        slot = (t['slot'] or '').lower()
+        if slot in FBX_SLOT_FIX: note = f"   << likely wrong slot: holds a {FBX_SLOT_FIX[slot]} map"
+        print(f"   [{tag}] {(t['material'] or '-')[:14]:14s} {(t['slot'] or '?'):22s} {short}{note}")
+        if hit:
+            dst = os.path.join(dest_dir, want)
+            if fix and os.path.abspath(hit) != os.path.abspath(dst):
+                shutil.copy2(hit, dst); placed.append(want)
+        else:
+            missing.append(want)
+    if fix and placed:
+        print(f"   placed {len(placed)} texture(s) beside the FBX under the names it asks for")
+    if missing: print(f"   {len(missing)} not found: {', '.join(sorted(set(missing))[:4])}")
+    return len(missing)
+
+def audit_blend(path, idx, fix=False):
+    if read_blend is None:
+        print("   (blendread.py not found beside texcheck.py - .blend skipped)"); return 0
+    info = read_blend(path)
+    print(f"   [{info['compression']} v{info['version']}]  {len(info['images'])} image datablock(s)")
+    if info['error']: print(f"   !! {info['error']}"); return 0
+    d = os.path.dirname(os.path.abspath(path))
+    mapping, ok, miss = {}, 0, []
+    for im in info['images']:
+        rel = im['path'][2:] if im['path'].startswith('//') else im['path']
+        if os.path.isfile(os.path.join(d, rel)): ok += 1; continue
+        base = basename_any(rel); hit = idx.get(base.lower())
+        if not hit:
+            stem = os.path.splitext(base)[0].lower()
+            for k, v in idx.items():
+                if os.path.splitext(k)[0] == stem: hit = v; break
+        if hit:
+            newrel = os.path.relpath(hit, d).replace(os.sep, '/')
+            mapping[im['path']] = '//' + newrel
+        else:
+            miss.append(base)
+    print(f"   resolve as written: {ok}   relinkable: {len(mapping)}   missing: {len(miss)}")
+    if mapping and not fix:
+        ex = list(mapping.items())[0]
+        print(f"   e.g. {ex[0]}  ->  {ex[1]}")
+    if fix and mapping:
+        ch, toolong = repoint_blend(path, mapping)
+        print(f"   rewrote {ch} path(s) in place (original kept as .bak)")
+        if toolong: print(f"   {len(toolong)} too long for the fixed buffer, left alone")
+    if miss: print(f"   not found: {', '.join(sorted(set(miss))[:4])}")
+    return len(miss)
 
 def main():
     ap = argparse.ArgumentParser(description="Find and fix broken texture links in OBJ/MTL.")
@@ -135,9 +215,19 @@ def main():
             for f in fs:
                 if f.lower().endswith('.obj'): objs.append(os.path.join(r,f))
                 elif f.lower().endswith('.mtl'): mtls.append(os.path.join(r,f))
+    elif t.lower().endswith(('.fbx','.blend')): objs=[]
     elif t.lower().endswith('.obj'): objs=[t]
     elif t.lower().endswith('.mtl'): mtls=[t]
     else: sys.exit('give me an .obj, an .mtl, or a folder')
+
+    fbxs, blends = [], []
+    if os.path.isdir(t):
+        for r,_,fs in os.walk(t):
+            for f in fs:
+                if f.lower().endswith('.fbx'): fbxs.append(os.path.join(r,f))
+                elif f.lower().endswith('.blend'): blends.append(os.path.join(r,f))
+    elif t.lower().endswith('.fbx'): fbxs=[t]
+    elif t.lower().endswith('.blend'): blends=[t]
 
     idx = build_index([root] + a.search)
     print(f"indexed {len(idx)} image files under {root}" + (f" (+{len(a.search)} extra)" if a.search else ""))
@@ -154,6 +244,14 @@ def main():
             elif ' ' in name:
                 print(f"   mtllib '{name}'  -> found, but the NAME CONTAINS SPACES (breaks many parsers)")
             if exists and path not in mtls: mtls.append(path)
+
+    for fb in fbxs:
+        print(f"\nFBX  {os.path.relpath(fb, root)}")
+        audit_fbx(fb, idx, a.fix)
+
+    for bl in blends:
+        print(f"\nBLEND  {os.path.relpath(bl, root)}")
+        audit_blend(bl, idx, a.fix)
 
     total_missing = 0
     for m in sorted(set(mtls)):

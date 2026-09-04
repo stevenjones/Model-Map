@@ -12,6 +12,14 @@ and save. Originals are kept as .bak. Download a tidy zip when you're done.
 Pure standard library. No pip install. Binds to localhost only.
 """
 import os, re, io, sys, json, shutil, zipfile, mimetypes, webbrowser, argparse
+try:
+    from fbxread import read_fbx
+except Exception:
+    read_fbx = None
+try:
+    from blendread import read_blend, repoint_blend
+except Exception:
+    read_blend = repoint_blend = None
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -25,6 +33,10 @@ OPTS_N = {'-bm':1,'-s':3,'-o':3,'-t':3,'-mm':2,'-texres':1,'-clamp':1,'-blendu':
 SLOT_FIX = {'map_ks':('map_Pr','holds a roughness map; map_Ks is specular colour'),
             'map_refl':('map_Pm','holds a metalness map; map_refl is an environment map'),
             'map_ns':('map_Pr','holds a roughness map; map_Ns is specular exponent')}
+# FBX slots that commonly hold the wrong kind of map
+FBX_SLOT_FIX = {'specularcolor':('roughness','SpecularColor is a specular COLOUR slot'),
+                'reflectioncolor':('metalness','ReflectionColor is an environment slot'),
+                'shininessexponent':('roughness','ShininessExponent is not roughness')}
 ROOT = None
 
 def split_map_line(rest):
@@ -68,13 +80,73 @@ def guess(raw, mtl_rel, imgs):
             return i, 'relinked (different extension)'
     return None, 'missing'
 
+def audit_fbx(imgs):
+    out = []
+    for f in find_files('.fbx') + find_files('.FBX'):
+        full = os.path.join(ROOT, f)
+        if read_fbx is None:
+            out.append({'file':f,'error':'fbxread.py not found beside texstudio.py',
+                        'format':'?','version':0,'rows':[],'materials':[]}); continue
+        info = read_fbx(full)
+        rows = []
+        for t in info['textures']:
+            new, status = guess(t['file'], f, imgs)
+            hint = FBX_SLOT_FIX.get((t['slot'] or '').lower())
+            rows.append({'slot':t['slot'] or '(unassigned)','mat':t['material'] or '-',
+                         'raw':t['file'],'resolved':new,'status':status,
+                         'slot_hint':hint,
+                         'expects':base_any(t['file'])})
+        out.append({'file':f,'format':info['format'],'version':info['version'],
+                    'materials':info['materials'],'rows':rows,'error':info['error']})
+    return out
+
+def blend_map(bl_rel):
+    """Work out which .blend image paths can be repointed to files we actually have."""
+    full = os.path.join(ROOT, bl_rel); d = os.path.dirname(full)
+    info = read_blend(full)
+    mapping, ok, miss = {}, 0, []
+    if info.get('error') or not info['ok']: return info, mapping, ok, miss
+    imgs = images()
+    for im in info['images']:
+        rel = im['path'][2:] if im['path'].startswith('//') else im['path']
+        if os.path.isfile(os.path.join(d, rel)): ok += 1; continue
+        base = base_any(rel); hit = None
+        for i in imgs:
+            if os.path.basename(i).lower() == base.lower(): hit = i; break
+        if not hit:
+            stem = os.path.splitext(base)[0].lower()
+            for i in imgs:
+                if os.path.splitext(os.path.basename(i))[0].lower() == stem: hit = i; break
+        if hit:
+            mapping[im['path']] = '//' + os.path.relpath(os.path.join(ROOT, hit), d).replace(os.sep,'/')
+        else: miss.append(base)
+    return info, mapping, ok, miss
+
+def audit_blend_all():
+    out = []
+    for f in find_files('.blend'):
+        if read_blend is None:
+            out.append({'file':f,'error':'blendread.py not found beside texstudio.py',
+                        'compression':'?','version':'','n':0,'ok':0,'relink':0,'missing':[],'sample':None})
+            continue
+        info, mapping, ok, miss = blend_map(f)
+        sample = None
+        if mapping:
+            k = next(iter(mapping)); sample = [k, mapping[k]]
+        out.append({'file':f,'error':info.get('error'),'compression':info.get('compression','?'),
+                    'version':info.get('version',''),'n':len(info.get('images',[])),
+                    'ok':ok,'relink':len(mapping),'missing':sorted(set(miss))[:6],'sample':sample})
+    return out
+
 def audit():
     imgs = images()
     objs = []
     for o in find_files('.obj'):
         named = []
         try:
-            for line in open(os.path.join(ROOT,o), errors='replace'):
+            with open(os.path.join(ROOT,o), errors='replace') as fh:
+                lines_o = fh.readlines()
+            for line in lines_o:
                 if line.lower().startswith('mtllib'):
                     rest = line.split(None,1)[1].strip()
                     d = os.path.dirname(os.path.join(ROOT,o))
@@ -93,7 +165,9 @@ def audit():
     mtls = []
     for m in find_files('.mtl'):
         rows, cur, matmaps = [], None, {}
-        for ln, line in enumerate(open(os.path.join(ROOT,m), errors='replace').read().splitlines()):
+        with open(os.path.join(ROOT,m), errors='replace') as fh:
+            _src = fh.read().splitlines()
+        for ln, line in enumerate(_src):
             s = line.strip()
             if not s or s.startswith('#'): continue
             key = s.split()[0].lower()
@@ -118,8 +192,13 @@ def audit():
                                      'slot_hint':None,'is_kd':True})
                 except ValueError: pass
         mtls.append({'file':m,'rows':rows})
-    unused = [i for i in imgs if not any(r.get('resolved')==i for mm in mtls for r in mm['rows'])]
-    return {'root':ROOT,'images':imgs,'objs':objs,'mtls':mtls,'unused':unused}
+    fbxs = audit_fbx(imgs)
+    blends = audit_blend_all()
+    used = {r.get('resolved') for mm in mtls for r in mm['rows']}
+    used |= {r.get('resolved') for fb in fbxs for r in fb['rows']}
+    unused = [i for i in imgs if i not in used]
+    return {'root':ROOT,'images':imgs,'objs':objs,'mtls':mtls,'fbxs':fbxs,
+            'blends':blends,'unused':unused}
 
 def apply_edits(payload):
     """edits: [{file, line, key, path}]  kd: [{file, line, value}]"""
@@ -129,7 +208,8 @@ def apply_edits(payload):
     changed = []
     for f, es in byfile.items():
         p = os.path.join(ROOT, f)
-        lines = open(p, errors='replace').read().splitlines()
+        with open(p, errors='replace') as fh:
+            lines = fh.read().splitlines()
         for e in es:
             i = int(e['line'])
             if i >= len(lines): continue
@@ -142,7 +222,8 @@ def apply_edits(payload):
                 rel = os.path.relpath(os.path.join(ROOT, e['path']), os.path.dirname(p)).replace(os.sep,'/')
                 lines[i] = f"{indent}{e['key']}{(' '+opts) if opts else ''} {rel}"
         if not os.path.exists(p + '.bak'): shutil.copy2(p, p + '.bak')
-        open(p,'w').write('\n'.join(lines) + '\n')
+        with open(p,'w') as fh:
+            fh.write('\n'.join(lines) + '\n')
         changed.append(f)
     return changed
 
@@ -162,6 +243,34 @@ def collect_maps():
                               'opts':r['opts'],'path':'maps/'+os.path.basename(r['resolved'])})
         if edits: apply_edits({'edits':edits})
     return moved
+
+def stage_fbx(fbx_rel):
+    """A binary FBX cannot be safely rewritten in place, but every importer falls back
+    to looking for the texture's BASENAME next to the FBX. So copy the files we found
+    to those exact names beside it - which is what actually fixes the import."""
+    a = audit(); done, missing = [], []
+    for fb in a['fbxs']:
+        if fbx_rel and fb['file'] != fbx_rel: continue
+        dest_dir = os.path.dirname(os.path.join(ROOT, fb['file'])) or ROOT
+        for r in fb['rows']:
+            want = r['expects']
+            if not r['resolved']:
+                missing.append(want); continue
+            src = os.path.join(ROOT, r['resolved'])
+            dst = os.path.join(dest_dir, want)
+            if os.path.abspath(src) != os.path.abspath(dst):
+                shutil.copy2(src, dst); done.append(want)
+    return {'placed': sorted(set(done)), 'missing': sorted(set(missing))}
+
+def fix_blends():
+    done = []
+    for f in find_files('.blend'):
+        if read_blend is None: break
+        info, mapping, ok, miss = blend_map(f)
+        if mapping:
+            ch, toolong = repoint_blend(os.path.join(ROOT, f), mapping)
+            done.append({'file':f,'changed':ch,'skipped':len(toolong)})
+    return done
 
 def make_zip():
     buf = io.BytesIO()
@@ -195,7 +304,9 @@ class H(BaseHTTPRequestHandler):
             except ValueError: return self._send(400,'{}')
             if not os.path.isfile(p): return self._send(404,'{}')
             ctype = mimetypes.guess_type(p)[0] or 'application/octet-stream'
-            return self._send(200, open(p,'rb').read(), ctype)
+            with open(p,'rb') as fh:
+                blob = fh.read()
+            return self._send(200, blob, ctype)
         if u.path == '/api/zip':
             return self._send(200, make_zip(), 'application/zip')
         return self._send(404,'{}')
@@ -204,6 +315,11 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get('Content-Length',0)); raw = self.rfile.read(n)
         if u.path == '/api/save':
             return self._send(200, json.dumps({'changed':apply_edits(json.loads(raw))}))
+        if u.path == '/api/fixblend':
+            return self._send(200, json.dumps({'done':fix_blends()}))
+        if u.path == '/api/stagefbx':
+            d = json.loads(raw or b'{}')
+            return self._send(200, json.dumps(stage_fbx(d.get('file'))))
         if u.path == '/api/collect':
             return self._send(200, json.dumps({'moved':collect_maps()}))
         if u.path == '/api/upload':
@@ -212,7 +328,8 @@ class H(BaseHTTPRequestHandler):
             for f in d['files']:
                 rel = f['name'].replace('\\','/').lstrip('/')
                 dest = safe(rel); os.makedirs(os.path.dirname(dest), exist_ok=True)
-                open(dest,'wb').write(base64.b64decode(f['data']))
+                with open(dest,'wb') as fh:
+                    fh.write(base64.b64decode(f['data']))
             return self._send(200, json.dumps({'saved':len(d['files'])}))
         return self._send(404,'{}')
 
@@ -258,10 +375,12 @@ padding:5px 7px;width:150px;font-family:ui-monospace,monospace;font-size:12px}
 <header><h1>Texture Studio</h1><span class="path" id="root"></span>
 <button onclick="save()">Save changes</button>
 <button class="ghost" onclick="collect()">Collect into maps/</button>
+<button class="ghost" onclick="stagefbx()">Place FBX textures</button>
+<button class="ghost" onclick="fixblend()">Repoint .blend paths</button>
 <button class="ghost" onclick="location.href='/api/zip'">Download zip</button>
 <button class="ghost" onclick="load()">Refresh</button><span id="msg"></span></header>
 <main>
-<div id="drop">Drop .obj, .mtl and texture files here (folders work too)</div>
+<div id="drop">Drop .obj, .mtl, .fbx, .blend and texture files here (folders work too)</div>
 <div id="out"></div></main>
 <script>
 let D=null;
@@ -324,6 +443,63 @@ async function load(){
     }
     c.appendChild(t);out.appendChild(c);
   }
+  for(const bl of (D.blends||[])){
+    const c=q('div');c.className='card';
+    c.innerHTML='<h2>'+bl.file+'  <span style="color:#8b93a3;font-weight:400">'
+      +bl.compression+' v'+bl.version+' · '+bl.n+' image datablock(s)</span></h2>';
+    const d=q('div');d.className='empty';
+    if(bl.error){d.appendChild(tag('CANNOT READ','bad'));d.append(' '+bl.error)}
+    else{
+      if(bl.relink){d.appendChild(tag(bl.relink+' RELINKABLE','fix'));d.append(' ')}
+      if(bl.ok){d.appendChild(tag(bl.ok+' OK','ok'));d.append(' ')}
+      if(bl.missing.length){d.appendChild(tag(bl.missing.length+' MISSING','bad'));
+        d.append(' '+bl.missing.join(', '))}
+      if(bl.sample){const s2=q('div');s2.className='hint';s2.style.marginTop='6px';
+        s2.textContent='e.g. '+bl.sample[0]+'  →  '+bl.sample[1];d.appendChild(s2)}
+      if(bl.relink){const s3=q('div');s3.className='hint';s3.style.marginTop='6px';
+        s3.style.color='#8b93a3';
+        s3.textContent='Blender stores each path in a fixed-size buffer, so a same-length-or-shorter '
+          +'replacement is written in place - nothing in the file moves. Use "Repoint .blend paths".';
+        d.appendChild(s3)}
+    }
+    c.appendChild(d);out.appendChild(c);
+  }
+  for(const fb of (D.fbxs||[])){
+    const c=q('div');c.className='card';
+    c.innerHTML='<h2>'+fb.file+'  <span style="color:#8b93a3;font-weight:400">'
+      +fb.format+' v'+fb.version+(fb.materials.length?' · '+fb.materials.length+' material(s)':'')+'</span></h2>';
+    if(fb.error){const d=q('div');d.className='empty';
+      d.appendChild(tag('READ ERROR','bad'));d.append(' '+fb.error);c.appendChild(d);out.appendChild(c);continue}
+    if(!fb.rows.length){const d=q('div');d.className='empty';
+      d.textContent='no texture references inside this FBX.';c.appendChild(d);out.appendChild(c);continue}
+    const t=q('table');
+    t.innerHTML='<tr><th></th><th>Material</th><th>Slot</th><th>Path inside the FBX</th>'
+               +'<th>Found in workspace</th><th>Status</th></tr>';
+    for(const r of fb.rows){
+      const tr=q('tr');const td=()=>{const x=q('td');tr.appendChild(x);return x};
+      const th=td();
+      if(r.resolved&&/\.(png|jpe?g|gif|webp|bmp)$/i.test(r.resolved)){
+        const im=q('img');im.className='th';im.src='/api/file?p='+encodeURIComponent(r.resolved);th.appendChild(im)}
+      td().innerHTML='<span class="mat">'+r.mat+'</span>';
+      td().textContent=r.slot;
+      const rw=td();rw.className='raw';rw.textContent=r.raw;rw.title=r.raw;
+      const fo=td();fo.textContent=r.resolved||'—';fo.style.fontSize='12px';
+      const st=td();
+      if(r.status==='ok')st.appendChild(tag('OK','ok'));
+      else if(r.status==='missing')st.appendChild(tag('MISSING','bad'));
+      else st.appendChild(tag('FOUND','fix'));
+      if(r.slot_hint){const h=q('div');h.className='hint';
+        h.textContent='likely wrong slot: '+r.slot_hint[1]+' but holds a '+r.slot_hint[0]+' map';st.appendChild(h)}
+      t.appendChild(tr);
+    }
+    c.appendChild(t);
+    const n=q('div');n.className='empty';n.style.fontSize='12px';
+    n.innerHTML='A binary FBX cannot be safely rewritten in place. '
+      +'<b>Place FBX textures</b> copies each map next to the FBX under the exact filename it '
+      +'asks for, which is what importers fall back to — that fixes the import without touching the FBX.';
+    c.appendChild(n);
+    out.appendChild(c);
+  }
   if(D.unused.length){
     const c=q('div');c.className='card';c.innerHTML='<h2>images in the folder that nothing references</h2>';
     const d=q('div');d.className='chips';
@@ -340,6 +516,18 @@ async function save(){
     kd.push({file:i.dataset.file,line:+i.dataset.line,value:i.value})});
   const r=await (await fetch('/api/save',{method:'POST',body:JSON.stringify({edits,kd})})).json();
   msg('saved — originals kept as .bak');load();
+}
+async function fixblend(){
+  const r=await (await fetch('/api/fixblend',{method:'POST',body:'{}'})).json();
+  const n=r.done.reduce((a,b)=>a+b.changed,0);
+  msg('repointed '+n+' path(s) across '+r.done.length+' .blend file(s) — originals kept as .bak');
+  load();
+}
+async function stagefbx(){
+  const r=await (await fetch('/api/stagefbx',{method:'POST',body:'{}'})).json();
+  let m='placed '+r.placed.length+' texture(s) beside the FBX';
+  if(r.missing.length) m+=' — still missing: '+r.missing.join(', ');
+  msg(m);load();
 }
 async function collect(){
   const r=await (await fetch('/api/collect',{method:'POST',body:'{}'})).json();
