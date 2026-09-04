@@ -16,13 +16,13 @@ import os, gzip, shutil, struct, tempfile
 
 def _decompress(path):
     """Return (raw_bytes, kind). kind is 'raw', 'gzip', or 'zstd' (unsupported)."""
-    with open(path, 'rb') as f: head = f.read(4)
-    if head[:7] == b'BLENDER'[:4] and open(path,'rb').read(7) == b'BLENDER':
+    with open(path, 'rb') as f: head = f.read(7)
+    if head[:7] == b'BLENDER':
         with open(path,'rb') as fh:
             return fh.read(), 'raw'
     if head[:2] == b'\x1f\x8b':
         with gzip.open(path,'rb') as f: return f.read(), 'gzip'
-    if head == b'\x28\xb5\x2f\xfd':
+    if head[:4] == b'\x28\xb5\x2f\xfd':
         try:
             import zstandard as zstd
             with open(path,'rb') as f:

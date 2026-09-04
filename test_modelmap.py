@@ -14,7 +14,7 @@ paths inside a real .blend, and if it gets the buffer arithmetic wrong it
 corrupts the file. Those tests assert the file's structure is untouched, not
 just that the paths look right.
 """
-import io, os, gzip, json, shutil, struct, sys, tempfile, unittest, zlib
+import gc, io, os, gzip, json, shutil, struct, sys, tempfile, unittest, warnings, zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import texcheck, fbxread, blendread
@@ -467,6 +467,61 @@ class TestModuleWiring(unittest.TestCase):
             self.assertTrue(inside.startswith(os.path.abspath(texstudio.ROOT)))
         finally:
             shutil.rmtree(texstudio.ROOT, ignore_errors=True)
+
+
+class TestNoFileHandleLeaks(unittest.TestCase):
+    """Catch leaked file handles for real.
+
+    `python -W error::ResourceWarning` does NOT fail the build: the warning is
+    raised inside the file object's finalizer, where an exception cannot
+    propagate, so Python prints "Exception ignored in:" and the exit code stays
+    0. Recording the warning around an explicit gc.collect() does work, and is
+    cross-platform (an fd count would need /proc).
+    """
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.d, 'textures'))
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def assertNoLeak(self, fn, label):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            fn()
+            gc.collect()
+        leaks = [w for w in caught if issubclass(w.category, ResourceWarning)]
+        detail = '; '.join(f'{w.filename}:{w.lineno}' for w in leaks)
+        self.assertEqual(leaks, [], f'{label} leaked {len(leaks)} file handle(s): {detail}')
+
+    def test_blendread_closes_handles(self):
+        p = make_blend(os.path.join(self.d, 'a.blend'), ['//textures/a.png'])
+        self.assertNoLeak(lambda: blendread.read_blend(p), 'read_blend (raw)')
+
+    def test_blendread_gzip_closes_handles(self):
+        p = make_blend(os.path.join(self.d, 'g.blend'), ['//textures/a.png'], compress=True)
+        self.assertNoLeak(lambda: blendread.read_blend(p), 'read_blend (gzip)')
+
+    def test_blend_repoint_closes_handles(self):
+        p = make_blend(os.path.join(self.d, 'r.blend'), ['//textures/a.png'])
+        self.assertNoLeak(lambda: blendread.repoint_blend(p, {'//textures/a.png': '//textures/a.jpg'}),
+                          'repoint_blend')
+
+    def test_fbxread_closes_handles(self):
+        p = make_fbx(os.path.join(self.d, 'a.fbx'), 7400,
+                     [('M1', 'tex/a.png', 'DiffuseColor', 'Mat')])
+        self.assertNoLeak(lambda: fbxread.read_fbx(p), 'read_fbx')
+
+    def test_texcheck_closes_handles(self):
+        tiny_png(os.path.join(self.d, 'textures', 'w.png'))
+        with open(os.path.join(self.d, 'm.mtl'), 'w') as f:
+            f.write('newmtl A\nmap_Kd N:\\dead\\w.png\n')
+        with open(os.path.join(self.d, 'm.obj'), 'w') as f:
+            f.write('mtllib m.mtl\n')
+        idx = texcheck.build_index([self.d])
+        def run():
+            texcheck.find_mtls(os.path.join(self.d, 'm.obj'))
+            texcheck.audit_mtl(os.path.join(self.d, 'm.mtl'), idx, fix=True)
+        self.assertNoLeak(run, 'texcheck')
 
 
 if __name__ == '__main__':

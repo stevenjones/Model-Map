@@ -12,9 +12,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.7 is the floor (ThreadingHTTPServer). Windows is included because the
-        # README claims it "should work but is untested" - this is what turns that
-        # into a tested claim, or tells us it doesn't.
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ['3.9', '3.12']
 
@@ -25,11 +22,16 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: No dependencies should be needed
+      - name: Python version (no dependencies should be installed)
         run: python -c "import sys; print(sys.version)"
 
       - name: All four modules import
         run: python -c "import texcheck, texstudio, fbxread, blendread; print('ok')"
 
-      - name: Run tests (ResourceWarning is an error)
-        run: python -W error::ResourceWarning -m unittest test_modelmap -v
+      # NOTE: -W error::ResourceWarning does NOT fail the build. ResourceWarning
+      # is raised in the file object's finalizer, where exceptions cannot
+      # propagate, so Python prints "Exception ignored in:" and exits 0.
+      # TestNoFileHandleLeaks is what actually catches leaks - it records
+      # warnings around an explicit gc.collect() and asserts on them.
+      - name: Run tests
+        run: python -m unittest test_modelmap -v
