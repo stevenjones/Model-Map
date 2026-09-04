@@ -1,0 +1,36 @@
+# Workspace the app scratches in
+texstudio_workspace/
+
+# Backups the tools write
+*.bak
+*.prev
+
+# macOS / Python noise
+.DS_Store
+__pycache__/
+
+# Model files — large, and some assets are not redistributable
+*.blend
+*.blend1
+*.fbx
+*.obj
+*.mtl
+*.max
+*.c4d
+*.mb
+*.dae
+*.usdc
+
+# Texture / image files — large (a single 2K set here is ~94 MB)
+*.png
+*.jpg
+*.jpeg
+*.tga
+*.tif
+*.tiff
+*.exr
+*.psd
+
+# Archives
+*.zip
+*.rar
