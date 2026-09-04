@@ -219,7 +219,7 @@ def audit_gltf(path, idx, fix=False):
     d = os.path.dirname(os.path.abspath(path))
     for b in info['buffers']:
         if b['embedded']: continue
-        ok = os.path.isfile(os.path.join(d, b['uri']))
+        ok = os.path.isfile(os.path.join(d, b['path']))
         print(f"   [{'OK  ' if ok else 'MISS'}] buffer   {b['uri']}"
               + ('' if ok else '   << the geometry lives here; without it there is no model'))
     mapping, miss = {}, []
@@ -229,7 +229,8 @@ def audit_gltf(path, idx, fix=False):
         uri = im['uri']
         if uri in seen: continue
         seen.add(uri)
-        rel = uri.replace('\\', '/')
+        # resolve against the PERCENT-DECODED path; 'uri' stays as stored
+        rel = im['path'].replace('\\', '/')
         exact = os.path.isfile(os.path.join(d, rel))
         base = basename_any(rel)
         hit = None if exact else idx.get(base.lower())

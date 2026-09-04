@@ -539,6 +539,45 @@ class TestGltf(unittest.TestCase):
         self.assertEqual(ch, 1)
         self.assertTrue(any('does not allow' in n for n in notes))
 
+    def test_percent_encoded_uri_is_decoded_for_resolution(self):
+        """glTF uris are percent-encoded, so my%20texture.png names 'my texture.png'.
+        Without decoding, every texture with a space in its name looks missing."""
+        p = self.write([{'uri': 'textures/my%20texture.png'}])
+        i = gltfread.read_gltf(p)
+        self.assertEqual(i['images'][0]['uri'], 'textures/my%20texture.png',
+                         'the stored uri must be left exactly as written')
+        self.assertEqual(i['images'][0]['path'], 'textures/my texture.png',
+                         'the resolvable path must be decoded')
+        self.assertEqual(i['images'][0]['ext'], '.png')
+        self.assertTrue(i['images'][0]['spec_ok'])
+
+    def test_repoint_writes_an_encoded_uri_back(self):
+        """A replacement containing a space must be written encoded, or the file
+        stops conforming to the spec."""
+        p = self.write([{'uri': 'a.png', 'mimeType': 'image/png'}])
+        ch, notes = gltfread.repoint_gltf(p, {'a.png': 'textures/my texture.jpg'})
+        self.assertEqual(ch, 1)
+        with open(p) as f: raw = json.load(f)
+        self.assertEqual(raw['images'][0]['uri'], 'textures/my%20texture.jpg')
+        self.assertEqual(raw['images'][0]['mimeType'], 'image/jpeg')
+        self.assertEqual(gltfread.read_gltf(p)['images'][0]['path'],
+                         'textures/my texture.jpg', 'must round-trip')
+
+    def test_repoint_matches_on_the_decoded_key_too(self):
+        p = self.write([{'uri': 'textures/my%20texture.png'}])
+        ch, _ = gltfread.repoint_gltf(p, {'textures/my texture.png': 'textures/ok.png'})
+        self.assertEqual(ch, 1)
+        self.assertEqual(gltfread.read_gltf(p)['images'][0]['uri'], 'textures/ok.png')
+
+    def test_embedded_images_are_never_repointed(self):
+        p = self.write([{'uri': 'data:image/png;base64,iVBORw0KGgo=', 'mimeType': 'image/png'},
+                        {'bufferView': 0, 'mimeType': 'image/png'}])
+        with open(p) as f: before = json.load(f)
+        ch, _ = gltfread.repoint_gltf(p, {'data:image/png;base64,iVBORw0KGgo=': 'x.png'})
+        self.assertEqual(ch, 0)
+        with open(p) as f: after = json.load(f)
+        self.assertEqual(before['images'], after['images'])
+
     def test_malformed_json_returns_error_not_exception(self):
         p = os.path.join(self.d, 'bad.gltf')
         with open(p, 'w') as f: f.write('{ not json')
@@ -577,6 +616,212 @@ class TestModuleWiring(unittest.TestCase):
             self.assertTrue(inside.startswith(os.path.abspath(texstudio.ROOT)))
         finally:
             shutil.rmtree(texstudio.ROOT, ignore_errors=True)
+
+
+class TestTexstudioGltf(unittest.TestCase):
+    """The app side of glTF. texcheck already handled .gltf while texstudio did
+    not, so a .gltf dropped on the page uploaded and was then silently ignored."""
+
+    def setUp(self):
+        import texstudio
+        self.ts = texstudio
+        self.d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.d, 'textures'))
+        self._saved_root = texstudio.ROOT
+        texstudio.ROOT = os.path.abspath(self.d)
+
+    def tearDown(self):
+        self.ts.ROOT = self._saved_root
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def write_gltf(self, images, buffers=None, name='m.gltf'):
+        doc = {'asset': {'version': '2.0', 'generator': 'test'},
+               'meshes': [{}], 'materials': [{}, {}],
+               'buffers': buffers if buffers is not None else [{'uri': 'm.bin'}],
+               'images': images}
+        p = os.path.join(self.d, name)
+        with open(p, 'w') as f: json.dump(doc, f)
+        return p
+
+    def rows(self, **kw):
+        g = self.ts.audit()['gltfs'][0]
+        return g, {r['uri']: r for r in g['rows'] if r['kind'] == 'image'}
+
+    # (a) SECURITY
+    def test_traversal_uri_is_refused_and_not_resolved(self):
+        """An image uri is attacker-controlled data. It must not resolve outside
+        the workspace, and must not become something /api/file will serve."""
+        self.write_gltf([{'uri': '../../../../etc/passwd'}])
+        g, imgs = self.rows()
+        row = imgs['../../../../etc/passwd']
+        self.assertEqual(row['status'], 'unsafe')
+        self.assertIsNone(row['resolved'], 'nothing outside ROOT may be offered up')
+        self.assertEqual(g['relink'], 0, 'and it must never be repointed')
+
+    def test_safe_refuses_a_sibling_directory_sharing_the_prefix(self):
+        """ROOT='/w' must not accept '/w2/x' - a plain startswith says it does."""
+        sib = self.d + '2'
+        os.makedirs(sib, exist_ok=True)
+        try:
+            with self.assertRaises(ValueError):
+                self.ts.safe('../' + os.path.basename(sib) + '/secret.png')
+        finally:
+            shutil.rmtree(sib, ignore_errors=True)
+
+    def test_api_file_cannot_serve_outside_the_workspace(self):
+        with self.assertRaises(ValueError):
+            self.ts.safe('../../../../etc/passwd')
+
+    # (b) never wire in something glTF cannot load
+    def test_wrong_format_is_reported_not_wired_in(self):
+        """Reference is .jpg and only an .exr exists: glTF permits PNG/JPEG only,
+        so wiring the .exr in would produce a file no viewer can open."""
+        with open(os.path.join(self.d, 'textures', 'rough.exr'), 'wb') as f:
+            f.write(b'\x76\x2f\x31\x01')
+        self.write_gltf([{'uri': 'textures/rough.jpg'}])
+        g, imgs = self.rows()
+        self.assertEqual(imgs['textures/rough.jpg']['status'], 'format')
+        self.assertIsNone(imgs['textures/rough.jpg']['resolved'])
+        self.assertEqual(g['relink'], 0)
+
+    def test_a_png_match_is_still_relinked(self):
+        tiny_png(os.path.join(self.d, 'textures', 'albedo.jpg'))
+        self.write_gltf([{'uri': 'textures/albedo.png', 'mimeType': 'image/png'}])
+        g, imgs = self.rows()
+        self.assertEqual(imgs['textures/albedo.png']['status'], 'relink')
+        self.assertEqual(g['relink'], 1)
+
+    # (c) embedded data is not a missing file
+    def test_embedded_images_are_not_reported_as_missing(self):
+        self.write_gltf([{'uri': 'data:image/png;base64,iVBORw0KGgo=', 'mimeType': 'image/png'},
+                         {'bufferView': 0, 'mimeType': 'image/png'}],
+                        buffers=[{'uri': 'data:application/octet-stream;base64,AAAA'}])
+        g, imgs = self.rows()
+        self.assertEqual(imgs, {}, 'embedded images are not files and get no row')
+        self.assertEqual(g['rows'], [], 'nor does an embedded buffer')
+
+    # (d) the buffer is worth its own row
+    def test_buffer_is_reported_separately(self):
+        self.write_gltf([])
+        g = self.ts.audit()['gltfs'][0]
+        bufs = [r for r in g['rows'] if r['kind'] == 'buffer']
+        self.assertEqual(len(bufs), 1)
+        self.assertEqual(bufs[0]['uri'], 'm.bin')
+        self.assertEqual(bufs[0]['status'], 'missing')
+        self.assertIn('geometry', bufs[0]['note'])
+        with open(os.path.join(self.d, 'm.bin'), 'wb') as f:
+            f.write(b'\0' * 8)
+        g = self.ts.audit()['gltfs'][0]
+        self.assertEqual([r for r in g['rows'] if r['kind'] == 'buffer'][0]['status'], 'ok')
+
+    # (e) dedupe
+    def test_repeated_uris_are_deduplicated(self):
+        """The Poly Haven picture frame has 8 image entries for 5 distinct files."""
+        tiny_png(os.path.join(self.d, 'textures', 'a.png'))
+        self.write_gltf([{'uri': 'textures/a.png'}] * 4)
+        g, imgs = self.rows()
+        self.assertEqual(len(imgs), 1, 'one row per distinct uri')
+
+    # (f) .glb is binary
+    def test_glb_is_skipped_not_parsed_as_json(self):
+        with open(os.path.join(self.d, 'binary.glb'), 'wb') as f:
+            f.write(b'glTF' + struct.pack('<II', 2, 20) + b'\0' * 12)
+        a = self.ts.audit()                      # must not raise
+        self.assertEqual([g['file'] for g in a['gltfs']], [])
+
+    # (g) mimeType must follow the extension
+    def test_repoint_updates_mimetype(self):
+        tiny_png(os.path.join(self.d, 'textures', 'albedo.jpg'))
+        self.write_gltf([{'uri': 'textures/albedo.png', 'mimeType': 'image/png'}])
+        done = self.ts.fix_gltfs()
+        self.assertEqual(done[0]['changed'], 1)
+        with open(os.path.join(self.d, 'm.gltf')) as f: doc = json.load(f)
+        self.assertEqual(doc['images'][0]['uri'], 'textures/albedo.jpg')
+        self.assertEqual(doc['images'][0]['mimeType'], 'image/jpeg')
+
+    # percent-encoding, through the app
+    def test_percent_encoded_uri_resolves_in_the_app(self):
+        tiny_png(os.path.join(self.d, 'textures', 'my texture.png'))
+        self.write_gltf([{'uri': 'textures/my%20texture.png'}])
+        g, imgs = self.rows()
+        self.assertEqual(imgs['textures/my%20texture.png']['status'], 'ok',
+                         'a space in the filename is not a missing texture')
+        self.assertEqual(imgs['textures/my%20texture.png']['resolved'],
+                         'textures/my texture.png')
+
+    # (h) performance
+    def test_image_index_is_built_once_per_audit(self):
+        """images() walks the whole workspace. Fine at 132 files, sluggish at 5000,
+        so it must not run once per glTF."""
+        tiny_png(os.path.join(self.d, 'textures', 'a.png'))
+        for n in ('one.gltf', 'two.gltf', 'three.gltf'):
+            self.write_gltf([{'uri': 'textures/a.png'}], name=n)
+        real, calls = self.ts.images, []
+        def counting():
+            calls.append(1); return real()
+        self.ts.images = counting
+        try:
+            a = self.ts.audit()
+        finally:
+            self.ts.images = real
+        self.assertEqual(len(a['gltfs']), 3)
+        self.assertEqual(len(calls), 1,
+                         f'workspace walked {len(calls)} times for 3 glTFs; expected 1')
+
+
+class TestTexstudioFormatCoverage(unittest.TestCase):
+    """The app must handle every format the CLI does.
+
+    texcheck grew .fbx, .blend and .gltf support while texstudio silently lagged
+    behind - twice. This class exists so that gap cannot open again unnoticed.
+    """
+    FORMATS = ('.obj', '.mtl', '.fbx', '.blend', '.gltf')
+    READERS = ('fbxread', 'blendread', 'gltfread')
+
+    def test_texstudio_imports_every_reader(self):
+        import texstudio
+        src = _read(texstudio.__file__)
+        for mod in self.READERS:
+            self.assertIn(f'from {mod} import', src,
+                          f'texstudio.py never imports {mod}, so its format is ignored')
+
+    def test_every_reader_is_optional_not_fatal(self):
+        """A missing reader must degrade to a note, never crash the app."""
+        import texstudio
+        src = _read(texstudio.__file__)
+        for name in ('read_fbx', 'read_blend', 'read_gltf'):
+            self.assertIn(f'{name} = ', src, f'{name} needs a None fallback')
+
+    def test_audit_returns_a_key_for_every_format(self):
+        import texstudio
+        d = tempfile.mkdtemp()
+        saved = texstudio.ROOT
+        texstudio.ROOT = os.path.abspath(d)
+        try:
+            a = texstudio.audit()
+        finally:
+            texstudio.ROOT = saved
+            shutil.rmtree(d, ignore_errors=True)
+        for key in ('objs', 'mtls', 'fbxs', 'blends', 'gltfs'):
+            self.assertIn(key, a, f"audit() has no '{key}' key, so the UI cannot show it")
+
+    def test_drop_zone_names_every_format(self):
+        import texstudio
+        drop = [ln for ln in texstudio.PAGE.splitlines() if 'id="drop"' in ln]
+        self.assertEqual(len(drop), 1)
+        for ext in self.FORMATS:
+            self.assertIn(ext, drop[0],
+                          f'the drop zone does not mention {ext}, so users will not know it works')
+
+    def test_the_cli_and_the_app_cover_the_same_formats(self):
+        """Whatever texcheck learns to audit, texstudio must learn too."""
+        import texstudio
+        cli = _read(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'texcheck.py'))
+        app = _read(texstudio.__file__)
+        for fmt, reader in (('.fbx', 'read_fbx'), ('.blend', 'read_blend'), ('.gltf', 'read_gltf')):
+            self.assertIn(fmt, cli)
+            self.assertIn(reader, app,
+                          f'texcheck audits {fmt} but texstudio has no {reader}')
 
 
 class TestNoFileHandleLeaks(unittest.TestCase):

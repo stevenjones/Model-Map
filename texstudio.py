@@ -20,11 +20,17 @@ try:
     from blendread import read_blend, repoint_blend
 except Exception:
     read_blend = repoint_blend = None
+try:
+    from gltfread import read_gltf, repoint_gltf
+except Exception:
+    read_gltf = repoint_gltf = None
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 
 IMG_EXT = ('.png','.jpg','.jpeg','.tga','.tif','.tiff','.bmp','.exr','.psd','.dds','.webp')
 VIEWABLE = ('.png','.jpg','.jpeg','.gif','.webp','.bmp')
+# the glTF spec permits PNG and JPEG only; anything else parses but will not load
+GLTF_OK = ('.png','.jpg','.jpeg')
 MAP_KEYS = ('map_kd','map_ka','map_ks','map_ke','map_ns','map_d','map_bump','bump','disp',
             'decal','refl','map_pr','map_pm','map_ao','norm','map_refl')
 OPTS_N = {'-bm':1,'-s':3,'-o':3,'-t':3,'-mm':2,'-texres':1,'-clamp':1,'-blendu':1,
@@ -139,6 +145,102 @@ def audit_blend_all():
                     'ok':ok,'relink':len(mapping),'missing':sorted(set(miss))[:6],'sample':sample})
     return out
 
+def _within_root(rel):
+    """True if rel stays inside ROOT. safe() is the same guard the upload and the
+    file-serving paths use, so a uri that fails here is also unservable."""
+    try:
+        safe(rel); return True
+    except ValueError:
+        return False
+
+def gltf_map(gl_rel, imgs):
+    """Resolve every image uri in one .gltf against the workspace.
+
+    Returns (info, rows, mapping). Rows are DEDUPED by uri - a real glTF names the
+    same texture once per material slot, so the Poly Haven picture frame has 8
+    image entries for 5 distinct files. imgs is passed in so audit() walks the
+    workspace once rather than once per glTF.
+
+    Image uris come from an untrusted file, so every resolved path goes through
+    safe(); one that escapes ROOT is refused rather than resolved or served.
+    """
+    full = os.path.join(ROOT, gl_rel)
+    info = read_gltf(full)
+    rows, mapping = [], {}
+    if info.get('error'): return info, rows, mapping
+    d = os.path.dirname(gl_rel)
+
+    def resolve(p):
+        cand = os.path.normpath(os.path.join(d, p.replace('\\','/'))).replace(os.sep,'/')
+        return cand if _within_root(cand) else None
+
+    # the .bin holds the geometry, so it gets its own row rather than being
+    # lumped in with the textures. Embedded buffers have no file to report.
+    for b in info['buffers']:
+        if b['embedded']: continue
+        cand = resolve(b['path'])
+        if cand is None:
+            rows.append({'kind':'buffer','uri':b['uri'],'resolved':None,'status':'unsafe',
+                         'note':'path escapes the workspace - refused'}); continue
+        ok = os.path.isfile(os.path.join(ROOT, cand))
+        rows.append({'kind':'buffer','uri':b['uri'],'resolved':None,
+                     'status':'ok' if ok else 'missing',
+                     'note':'' if ok else 'the geometry lives here; without it there is no model'})
+
+    seen = set()
+    for im in info['images']:
+        # data: uris and bufferView images are embedded - not missing files
+        if im['embedded']: continue
+        uri = im['uri']
+        if uri in seen: continue
+        seen.add(uri)
+        flags = []
+        if not im['spec_ok']: flags.append('NOT PNG/JPEG - invalid in glTF')
+        if not im['mime_matches']: flags.append(f"mimeType says {im['mimeType']}")
+        cand = resolve(im['path'])
+        if cand is None:
+            rows.append({'kind':'image','uri':uri,'resolved':None,'status':'unsafe',
+                         'note':'path escapes the workspace - refused'}); continue
+        if cand in imgs:
+            rows.append({'kind':'image','uri':uri,'resolved':cand,'status':'ok',
+                         'note':'; '.join(flags)}); continue
+        base = base_any(im['path']).lower(); hit = None
+        for i in imgs:
+            if os.path.basename(i).lower() == base: hit = i; break
+        if not hit:
+            stem = os.path.splitext(base)[0]
+            for i in imgs:
+                if os.path.splitext(os.path.basename(i))[0].lower() == stem: hit = i; break
+        if not hit:
+            rows.append({'kind':'image','uri':uri,'resolved':None,'status':'missing',
+                         'note':'; '.join(flags)}); continue
+        ext = os.path.splitext(hit)[1].lower()
+        if ext not in GLTF_OK:
+            # wiring this in would leave a file no glTF viewer can load, so leave it
+            flags.append(f'only a {ext} exists, which glTF cannot use')
+            rows.append({'kind':'image','uri':uri,'resolved':None,'status':'format',
+                         'note':'; '.join(flags)}); continue
+        mapping[uri] = os.path.relpath(os.path.join(ROOT, hit),
+                                       os.path.dirname(full)).replace(os.sep,'/')
+        rows.append({'kind':'image','uri':uri,'resolved':hit,'status':'relink',
+                     'note':'; '.join(flags)})
+    return info, rows, mapping
+
+def audit_gltf_all(imgs):
+    """.glb is binary, not JSON - find_files('.gltf') does not match it, so it is
+    skipped rather than parsed."""
+    out = []
+    for f in find_files('.gltf'):
+        if read_gltf is None:
+            out.append({'file':f,'error':'gltfread.py not found beside texstudio.py',
+                        'version':'','generator':'','counts':{},'rows':[],'relink':0})
+            continue
+        info, rows, mapping = gltf_map(f, imgs)
+        out.append({'file':f,'error':info.get('error'),'version':info.get('version',''),
+                    'generator':info.get('generator',''),'counts':info.get('counts',{}),
+                    'rows':rows,'relink':len(mapping)})
+    return out
+
 def audit():
     imgs = images()
     objs = []
@@ -195,11 +297,13 @@ def audit():
         mtls.append({'file':m,'rows':rows})
     fbxs = audit_fbx(imgs)
     blends = audit_blend_all()
+    gltfs = audit_gltf_all(imgs)
     used = {r.get('resolved') for mm in mtls for r in mm['rows']}
     used |= {r.get('resolved') for fb in fbxs for r in fb['rows']}
+    used |= {r.get('resolved') for g in gltfs for r in g['rows']}
     unused = [i for i in imgs if i not in used]
     return {'root':ROOT,'images':imgs,'objs':objs,'mtls':mtls,'fbxs':fbxs,
-            'blends':blends,'unused':unused}
+            'blends':blends,'gltfs':gltfs,'unused':unused}
 
 def apply_edits(payload):
     """edits: [{file, line, key, path}]  kd: [{file, line, value}]"""
@@ -273,6 +377,17 @@ def fix_blends():
             done.append({'file':f,'changed':ch,'skipped':len(toolong)})
     return done
 
+def fix_gltfs():
+    done = []
+    if repoint_gltf is None: return done
+    imgs = images()
+    for f in find_files('.gltf'):
+        info, rows, mapping = gltf_map(f, imgs)
+        if mapping:
+            ch, notes = repoint_gltf(os.path.join(ROOT, f), mapping)
+            done.append({'file':f,'changed':ch,'notes':notes})
+    return done
+
 def make_zip():
     buf = io.BytesIO()
     with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
@@ -285,8 +400,16 @@ def make_zip():
     return buf.getvalue()
 
 def safe(rel):
-    p = os.path.abspath(os.path.join(ROOT, rel))
-    if not p.startswith(os.path.abspath(ROOT)): raise ValueError('path escape')
+    """Resolve rel inside ROOT or refuse it.
+
+    The prefix test needs the separator: without it ROOT='/w' also accepts
+    '/w2/secret.png', a sibling directory that merely starts with the same
+    string. Uploads, /api/file and every uri read out of a model file go
+    through here.
+    """
+    root = os.path.abspath(ROOT)
+    p = os.path.abspath(os.path.join(root, rel))
+    if p != root and not p.startswith(root + os.sep): raise ValueError('path escape')
     return p
 
 class H(BaseHTTPRequestHandler):
@@ -318,6 +441,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({'changed':apply_edits(json.loads(raw))}))
         if u.path == '/api/fixblend':
             return self._send(200, json.dumps({'done':fix_blends()}))
+        if u.path == '/api/fixgltf':
+            return self._send(200, json.dumps({'done':fix_gltfs()}))
         if u.path == '/api/stagefbx':
             d = json.loads(raw or b'{}')
             return self._send(200, json.dumps(stage_fbx(d.get('file'))))
@@ -378,10 +503,11 @@ padding:5px 7px;width:150px;font-family:ui-monospace,monospace;font-size:12px}
 <button class="ghost" onclick="collect()">Collect into maps/</button>
 <button class="ghost" onclick="stagefbx()">Place FBX textures</button>
 <button class="ghost" onclick="fixblend()">Repoint .blend paths</button>
+<button class="ghost" onclick="fixgltf()">Repoint .gltf paths</button>
 <button class="ghost" onclick="location.href='/api/zip'">Download zip</button>
 <button class="ghost" onclick="load()">Refresh</button><span id="msg"></span></header>
 <main>
-<div id="drop">Drop .obj, .mtl, .fbx, .blend and texture files here (folders work too)</div>
+<div id="drop">Drop .obj, .mtl, .fbx, .blend, .gltf and texture files here (folders work too)</div>
 <div id="out"></div></main>
 <script>
 let D=null;
@@ -465,6 +591,48 @@ async function load(){
     }
     c.appendChild(d);out.appendChild(c);
   }
+  for(const g of (D.gltfs||[])){
+    const c=q('div');c.className='card';
+    const cts=g.counts||{};
+    c.innerHTML='<h2>'+g.file+'  <span style="color:#8b93a3;font-weight:400">glTF '
+      +(g.version||'?')+(g.generator?' · '+g.generator:'')
+      +' · '+(cts.materials||0)+' material(s) · '+(cts.images||0)+' image reference(s)</span></h2>';
+    if(g.error){const d=q('div');d.className='empty';
+      d.appendChild(tag('CANNOT READ','bad'));d.append(' '+g.error);
+      c.appendChild(d);out.appendChild(c);continue}
+    if(!g.rows.length){const d=q('div');d.className='empty';
+      d.textContent='no external file references (everything is embedded).';
+      c.appendChild(d);out.appendChild(c);continue}
+    const t=q('table');
+    t.innerHTML='<tr><th></th><th>Kind</th><th>Reference in the file</th>'
+               +'<th>Found in workspace</th><th>Status</th></tr>';
+    for(const r of g.rows){
+      const tr=q('tr');const td=()=>{const x=q('td');tr.appendChild(x);return x};
+      const th=td();
+      if(r.resolved&&/\.(png|jpe?g|gif|webp|bmp)$/i.test(r.resolved)){
+        const im=q('img');im.className='th';
+        im.src='/api/file?p='+encodeURIComponent(r.resolved);th.appendChild(im)}
+      td().textContent=r.kind;
+      const rw=td();rw.className='raw';rw.textContent=r.uri;rw.title=r.uri;
+      const fo=td();fo.textContent=r.resolved||'—';fo.style.fontSize='12px';
+      const st=td();
+      if(r.status==='ok')st.appendChild(tag('OK','ok'));
+      else if(r.status==='relink')st.appendChild(tag('RELINKABLE','fix'));
+      else if(r.status==='format')st.appendChild(tag('WRONG FORMAT','warn'));
+      else if(r.status==='unsafe')st.appendChild(tag('REFUSED','bad'));
+      else st.appendChild(tag('MISSING','bad'));
+      if(r.note){const h=q('div');h.className='hint';h.textContent=r.note;st.appendChild(h)}
+      t.appendChild(tr);
+    }
+    c.appendChild(t);
+    const n=q('div');n.className='empty';n.style.fontSize='12px';
+    n.innerHTML='A .gltf is JSON, so paths are rewritten in place and the .bin and all '
+      +'binary data are left untouched. <b>Repoint .gltf paths</b> writes the working paths '
+      +'(percent-encoded) and corrects mimeType to match. glTF permits PNG and JPEG only, so '
+      +'a reference whose only match on disk is e.g. an .exr is reported and left alone.';
+    c.appendChild(n);
+    out.appendChild(c);
+  }
   for(const fb of (D.fbxs||[])){
     const c=q('div');c.className='card';
     c.innerHTML='<h2>'+fb.file+'  <span style="color:#8b93a3;font-weight:400">'
@@ -522,6 +690,12 @@ async function fixblend(){
   const r=await (await fetch('/api/fixblend',{method:'POST',body:'{}'})).json();
   const n=r.done.reduce((a,b)=>a+b.changed,0);
   msg('repointed '+n+' path(s) across '+r.done.length+' .blend file(s) — originals kept as .bak');
+  load();
+}
+async function fixgltf(){
+  const r=await (await fetch('/api/fixgltf',{method:'POST',body:'{}'})).json();
+  const n=r.done.reduce((a,b)=>a+b.changed,0);
+  msg('repointed '+n+' uri(s) across '+r.done.length+' .gltf file(s) — originals kept as .bak');
   load();
 }
 async function stagefbx(){

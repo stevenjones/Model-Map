@@ -14,9 +14,15 @@ Two checks specific to glTF that the OBJ/FBX/.blend paths don't need:
   * Each image may declare a mimeType. If it says image/jpeg and the uri ends
     .png, the two disagree and loaders behave inconsistently.
 
+glTF uris are PERCENT-ENCODED, so 'my%20texture.png' names the file
+'my texture.png'. Resolution therefore happens on the decoded 'path', while the
+stored 'uri' is left exactly as written; repointing encodes the new value again
+so the file keeps conforming.
+
     from gltfread import read_gltf, repoint_gltf
 """
 import json, os, shutil
+from urllib.parse import unquote, quote
 
 SPEC_OK = ('.png', '.jpg', '.jpeg')
 MIME = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg'}
@@ -25,7 +31,10 @@ MIME = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg'}
 def read_gltf(path):
     """-> {'ok','version','generator','images':[...],'buffers':[...],'error'}
 
-    images: {'index','uri','mimeType','ext','spec_ok','mime_matches','embedded'}
+    images: {'index','uri','path','mimeType','ext','spec_ok','mime_matches','embedded'}
+
+    'uri' is the raw string as stored; 'path' is that percent-decoded, and is
+    the one to resolve against the filesystem.
     """
     out = {'ok': False, 'version': '', 'generator': '', 'images': [],
            'buffers': [], 'counts': {}, 'error': None}
@@ -43,19 +52,22 @@ def read_gltf(path):
                          ('meshes', 'materials', 'nodes', 'textures', 'images')}
         for b in d.get('buffers', []):
             uri = b.get('uri')
-            out['buffers'].append({'uri': uri, 'embedded': uri is None or
-                                   str(uri).startswith('data:')})
+            emb = uri is None or str(uri).startswith('data:')
+            out['buffers'].append({'uri': uri, 'embedded': emb,
+                                   'path': '' if emb else unquote(str(uri))})
         for i, im in enumerate(d.get('images', [])):
             uri = im.get('uri')
             if uri is None or str(uri).startswith('data:'):
-                out['images'].append({'index': i, 'uri': uri, 'mimeType': im.get('mimeType', ''),
+                out['images'].append({'index': i, 'uri': uri, 'path': '',
+                                      'mimeType': im.get('mimeType', ''),
                                       'ext': '', 'spec_ok': True, 'mime_matches': True,
                                       'embedded': True})
                 continue
-            ext = os.path.splitext(uri)[1].lower()
+            path = unquote(str(uri))
+            ext = os.path.splitext(path)[1].lower()
             mt = im.get('mimeType', '')
             out['images'].append({
-                'index': i, 'uri': uri, 'mimeType': mt, 'ext': ext,
+                'index': i, 'uri': uri, 'path': path, 'mimeType': mt, 'ext': ext,
                 'spec_ok': ext in SPEC_OK,
                 'mime_matches': (not mt) or MIME.get(ext) == mt,
                 'embedded': False})
@@ -66,7 +78,11 @@ def read_gltf(path):
 
 
 def repoint_gltf(path, mapping, backup=True, fix_mime=True):
-    """Rewrite image uris. mapping: {old_uri: new_uri}. Returns (changed, notes).
+    """Rewrite image uris. mapping: {old: new}, keyed by the stored uri or by its
+    decoded form; values are ordinary paths. Returns (changed, notes).
+
+    The new value is percent-encoded on the way in, so a replacement containing a
+    space is written as my%20texture.png and the file stays spec-conformant.
 
     Also corrects mimeType to match the new extension when fix_mime is set,
     otherwise a repoint from .png to .jpg leaves a mimeType that contradicts it.
@@ -76,9 +92,14 @@ def repoint_gltf(path, mapping, backup=True, fix_mime=True):
     changed, notes = 0, []
     for im in d.get('images', []):
         uri = im.get('uri')
-        if uri in mapping and mapping[uri] != uri:
-            new = mapping[uri]
-            im['uri'] = new
+        # data: uris and bufferView images are embedded - there is no file to repoint
+        if uri is None or str(uri).startswith('data:'):
+            continue
+        dec = unquote(str(uri))
+        key = uri if uri in mapping else (dec if dec in mapping else None)
+        if key is not None and mapping[key] not in (uri, dec):
+            new = mapping[key]
+            im['uri'] = quote(new, safe='/')
             changed += 1
             ext = os.path.splitext(new)[1].lower()
             if fix_mime and 'mimeType' in im and ext in MIME and im['mimeType'] != MIME[ext]:
@@ -108,4 +129,6 @@ if __name__ == '__main__':
             flags = []
             if not im['spec_ok']: flags.append('NOT PNG/JPEG - invalid in glTF')
             if not im['mime_matches']: flags.append(f"mimeType says {im['mimeType']}")
-            print(f"   image {im['index']}  {im['uri']}" + ('   << ' + '; '.join(flags) if flags else ''))
+            shown = im['uri'] if im['embedded'] or im['path'] == im['uri'] else \
+                f"{im['uri']}  (= {im['path']})"
+            print(f"   image {im['index']}  {shown}" + ('   << ' + '; '.join(flags) if flags else ''))
